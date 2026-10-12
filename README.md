@@ -44,6 +44,8 @@ pipeline more adaptable without changing the stable default workflows:
 
 - remembers a discovered Receiver by its stable identity instead of losing the
   selection when its Thunderbolt or network IP changes
+- migrates saved display profiles, codec choices, and extended-desktop placement
+  when upgrading from the previous Receiver identities
 - offers per-Receiver H.264, HEVC, or automatic hardware codec selection with
   a safe fallback when a selected codec is unavailable
 - adds `Full HD` and `Full HD 60` 1:1 stream profiles for non-Retina 1080p

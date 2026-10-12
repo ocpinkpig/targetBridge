@@ -520,6 +520,7 @@ final class TBDisplaySenderService: ObservableObject {
     }
 
     func applyDiscoveredReceiver(_ receiver: TBDiscoveredReceiver, to session: TBDisplaySenderSession) {
+        migrateReceiverPreferences(for: receiver)
         session.selectedReceiverID = receiver.stableIdentity
         session.receiverIP = receiver.ip(for: session.transportKind)
         session.receiverSupportsHEVCDecodeHint = receiver.supportsHEVCDecode
@@ -547,6 +548,7 @@ final class TBDisplaySenderService: ObservableObject {
                 continue
             }
 
+            migrateReceiverPreferences(for: receiver)
             session.selectedReceiverID = receiver.stableIdentity
             session.receiverIP = receiver.ip(for: session.transportKind)
             session.receiverSupportsHEVCDecodeHint = receiver.supportsHEVCDecode
@@ -568,18 +570,32 @@ final class TBDisplaySenderService: ObservableObject {
     }
 
     private func receiverCodecPreferenceKey(for receiver: TBDiscoveredReceiver) -> String {
-        "service:\(receiver.serviceName)"
+        receiver.stableIdentity
     }
 
     private func receiverCodecPreferenceKey(for session: TBDisplaySenderSession) -> String? {
-        let selectedID = session.selectedReceiverID.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let serviceName = selectedID.split(separator: "|", maxSplits: 1).first,
-           !serviceName.isEmpty {
-            return "service:\(serviceName)"
-        }
+        TBReceiverPreferenceMigration.codecKey(
+            identity: session.selectedReceiverID, receiverIP: session.receiverIP
+        )
+    }
 
-        let receiverIP = session.receiverIP.trimmingCharacters(in: .whitespacesAndNewlines)
-        return receiverIP.isEmpty ? nil : "ip:\(receiverIP)"
+    private func migrateReceiverPreferences(for receiver: TBDiscoveredReceiver) {
+        var profiles = persistedDisplayProfiles
+        TBReceiverPreferenceMigration.migrateProfiles(
+            &profiles, identity: receiver.stableIdentity,
+            matchesIdentity: receiver.matchesPersistedIdentity
+        )
+        if profiles != persistedDisplayProfiles {
+            UserDefaults.standard.set(profiles, forKey: Self.receiverDisplayProfilesKey)
+        }
+        var codecs = persistedCodecPreferences
+        TBReceiverPreferenceMigration.migrateCodecs(
+            &codecs, identity: receiver.stableIdentity, serviceName: receiver.serviceName,
+            matchesIdentity: receiver.matchesPersistedIdentity
+        )
+        if codecs != persistedCodecPreferences {
+            UserDefaults.standard.set(codecs, forKey: Self.receiverCodecPreferencesKey)
+        }
     }
 
     private func restoreCodecPreference(
