@@ -130,7 +130,8 @@ TargetBridge now has a conservative manifest-based addon system. Official manife
 ## Requirements
 
 - Sender: Apple Silicon Mac (M1 or later) or Intel Mac, macOS 14 Sonoma or later. Apple Silicon remains the primary tested path; Intel Sender builds are available for broader testing.
-- Receiver: Intel or Apple Silicon Mac, macOS 11 Big Sur or later
+- Pre-built Receiver: macOS 14 Sonoma or later on Intel; macOS 15 Sequoia or later on Apple Silicon.
+- The Receiver source targets macOS 11, but builds for older systems require compatible libraries. Older-system packaging remains tracked in [#167](https://github.com/swellweb/targetBridge/issues/167).
 - Thunderbolt cable
 - See also [docs/Hardware.md](docs/Hardware.md) for hardware details, tested cables, adapters, and Thunderbolt networking ideas.
 
