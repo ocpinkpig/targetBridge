@@ -121,6 +121,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<EOF
 EOF
 
 printf 'APPL????' > "$APP_DIR/Contents/PkgInfo"
+# Match the launch requirement to the bundled runtimes before sealing the app.
+zsh "$SCRIPT_DIR/set_receiver_minimum_macos.sh" "$APP_DIR"
 # Sign the complete bundle only after all runtime dependencies are present.
 "$SCRIPT_DIR/sign_targetbridge_receiver_app.sh" "$APP_DIR"
 
