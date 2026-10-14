@@ -1956,17 +1956,30 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
 
     private func extendedArrangementDefaultsKey(for profile: TBMonitorDisplayProfile) -> String {
-        let normalizedIdentity = receiverIdentityDiscriminator(for: profile).replacingOccurrences(
-            of: #"[^A-Za-z0-9._-]+"#,
-            with: "-",
-            options: .regularExpression
+        TBExtendedArrangementMigration.key(
+            prefix: Self.extendedArrangementDefaultsPrefix,
+            identity: receiverIdentityDiscriminator(for: profile),
+            width: profile.panelWidth, height: profile.panelHeight
         )
-        return "\(Self.extendedArrangementDefaultsPrefix).\(normalizedIdentity).\(profile.panelWidth)x\(profile.panelHeight)"
     }
 
     private func loadSavedExtendedDisplayArrangement(for profile: TBMonitorDisplayProfile) -> SavedExtendedDisplayArrangement? {
-        let key = extendedArrangementDefaultsKey(for: profile)
-        guard let stored = UserDefaults.standard.dictionary(forKey: key) else {
+        let receiver = TBDisplaySenderService.shared.discoveredReceivers.first {
+            $0.matchesPersistedIdentity(selectedReceiverID) ||
+                $0.preferredIP == receiverIP || $0.thunderboltIP == receiverIP ||
+                $0.networkIP == receiverIP
+        }
+        var aliases: [String] = []
+        if let receiver { aliases.append("service:\(receiver.serviceName)") }
+        if selectedReceiverID.contains("|"),
+           let oldService = selectedReceiverID.split(separator: "|", maxSplits: 1).first {
+            aliases.append("service:\(oldService)")
+        }
+        guard let stored = TBExtendedArrangementMigration.load(
+            defaults: .standard, prefix: Self.extendedArrangementDefaultsPrefix,
+            identity: receiverIdentityDiscriminator(for: profile), legacyIdentities: aliases,
+            width: profile.panelWidth, height: profile.panelHeight
+        ) else {
             return nil
         }
 

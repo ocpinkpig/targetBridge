@@ -44,6 +44,8 @@ pipeline more adaptable without changing the stable default workflows:
 
 - remembers a discovered Receiver by its stable identity instead of losing the
   selection when its Thunderbolt or network IP changes
+- migrates saved display profiles, codec choices, and extended-desktop placement
+  when upgrading from the previous Receiver identities
 - offers per-Receiver H.264, HEVC, or automatic hardware codec selection with
   a safe fallback when a selected codec is unavailable
 - adds `Full HD` and `Full HD 60` 1:1 stream profiles for non-Retina 1080p
@@ -128,7 +130,8 @@ TargetBridge now has a conservative manifest-based addon system. Official manife
 ## Requirements
 
 - Sender: Apple Silicon Mac (M1 or later) or Intel Mac, macOS 14 Sonoma or later. Apple Silicon remains the primary tested path; Intel Sender builds are available for broader testing.
-- Receiver: Intel or Apple Silicon Mac, macOS 11 Big Sur or later
+- Pre-built Receiver: macOS 14 Sonoma or later on Intel; macOS 15 Sequoia or later on Apple Silicon.
+- The Receiver source targets macOS 11, but builds for older systems require compatible libraries. Older-system packaging remains tracked in [#167](https://github.com/swellweb/targetBridge/issues/167).
 - Thunderbolt cable
 - See also [docs/Hardware.md](docs/Hardware.md) for hardware details, tested cables, adapters, and Thunderbolt networking ideas.
 
