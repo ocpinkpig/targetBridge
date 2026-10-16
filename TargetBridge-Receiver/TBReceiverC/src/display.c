@@ -9,6 +9,7 @@
 #include "display.h"
 #include "tb_i18n.h"
 #include "tb_gesture_bridge.h"
+#include "status_layout.h"
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
@@ -21,7 +22,7 @@
 #include <string.h>
 
 #ifndef TB_RECEIVER_VERSION
-#define TB_RECEIVER_VERSION "3.6.0"
+#define TB_RECEIVER_VERSION "3.6.1"
 #endif
 
 #ifndef TB_RECEIVER_BUILD
@@ -459,22 +460,25 @@ static void tb_disp_rebuild_status_texture(struct tb_display *d,
      * for a bottom-left origin and drew upside down (title at the bottom, each
      * caption under its value). It is the same layout measured from the top:
      * every baseline y became H - y and every rect top became H - y - height. */
-    const CGFloat H = (CGFloat)drawable_h;
+    const struct tb_status_layout layout = tb_status_layout_for_size(drawable_w, drawable_h);
+    CGContextScaleCTM(ctx, layout.scale, layout.scale);
+    const CGFloat W = layout.width;
+    const CGFloat H = layout.height;
 
-    tb_disp_fill_rect(ctx, 0, 0, (CGFloat)drawable_w, H, 0.06, 0.07, 0.09, 1.0);
-    tb_disp_fill_rect(ctx, 48, 52, (CGFloat)drawable_w - 96, H - 104, 0.11, 0.12, 0.15, 1.0);
-    tb_disp_fill_rect(ctx, 48, 150, (CGFloat)drawable_w - 96, 2, 0.22, 0.24, 0.29, 1.0);
+    tb_disp_fill_rect(ctx, 0, 0, W, H, 0.06, 0.07, 0.09, 1.0);
+    tb_disp_fill_rect(ctx, 48, 52, W - 96, H - 104, 0.11, 0.12, 0.15, 1.0);
+    tb_disp_fill_rect(ctx, 48, 150, W - 96, 2, 0.22, 0.24, 0.29, 1.0);
 
     const CGFloat outer_x = 72.0;
-    const CGFloat outer_w = (CGFloat)drawable_w - 144.0;
+    const CGFloat outer_w = W - 144.0;
     const CGFloat top_y = 176.0;
     const CGFloat card_gap = 28.0;
     const CGFloat card_w = (outer_w - card_gap) / 2.0;
 
     tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.title"), title_font, 28, 72, 84, 0.95, 0.97, 1.0);
     tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.subtitle"), body_font, 17, 72, 118, 0.72, 0.76, 0.84);
-    tb_disp_draw_text(ctx, TB_RECEIVER_VERSION, mono_bold_font, 17, (CGFloat)drawable_w - 220, 82, 0.64, 0.69, 0.78);
-    tb_disp_draw_text(ctx, TB_RECEIVER_BUILD, mono_font, 13, (CGFloat)drawable_w - 220, 114, 0.53, 0.57, 0.66);
+    tb_disp_draw_text(ctx, TB_RECEIVER_VERSION, mono_bold_font, 17, W - 220, 82, 0.64, 0.69, 0.78);
+    tb_disp_draw_text(ctx, TB_RECEIVER_BUILD, mono_font, 13, W - 220, 114, 0.53, 0.57, 0.66);
 
     tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.ip_thunderbolt_bridge"), section_font, 15, outer_x, top_y, 0.54, 0.62, 0.76);
     tb_disp_draw_text(ctx, ip, mono_bold_font, 34, outer_x, top_y + 42.0, 0.43, 0.93, 0.60);

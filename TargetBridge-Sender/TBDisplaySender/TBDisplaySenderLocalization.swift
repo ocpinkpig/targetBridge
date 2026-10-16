@@ -31,8 +31,8 @@ enum TBDisplaySenderLanguage: String, CaseIterable, Identifiable {
         }
     }
 
-    static func load() -> TBDisplaySenderLanguage {
-        guard let raw = UserDefaults.standard.string(forKey: defaultsKey),
+    static func load(defaults: UserDefaults = .standard) -> TBDisplaySenderLanguage {
+        guard let raw = defaults.string(forKey: defaultsKey),
               let language = TBDisplaySenderLanguage(rawValue: raw) else {
             return preferred(by: Locale.preferredLanguages)
         }
