@@ -98,6 +98,23 @@ but no screen recording or input permissions. This is separate from `make test`
 so the portable test suite remains usable without a GUI. It does not replace
 live verification of notification suppression during a real stream.
 
+## Direct USB (manual)
+
+Requires two Macs and a USB-C/USB4 cable. Not covered by unit tests.
+
+1. Connect the Macs with a USB-C cable, keep Wi-Fi on on both.
+2. Receiver shows `Direct USB-NCM IP = 169.254.x.y`.
+3. Sender: choose **Direct USB**, pick the `en*` · `169.254.*` interface, Connect.
+4. Confirm the log line shows the pinned interface and the stream reaches
+   `streaming`; run the cable test and confirm USB-class throughput. In the
+   `connect: dialing` log line, look for `pinned=en…`:
+
+   ```bash
+   log stream --predicate 'subsystem CONTAINS "TargetBridge"'
+   ```
+
+5. Unplug the cable mid-session; confirm the existing reconnect/failure path.
+
 ## Debugging a live connection
 
 The sender logs its connection lifecycle (dial target, interface, waiting/
