@@ -279,4 +279,11 @@ final class TBConnectionDiagnosticsTests: XCTestCase {
         )
         XCTAssertNil(TBConnectionDiagnostics.selectBestMeasurement([wifi], preference: .wired))
     }
+
+    func testPathKindMapsToTransportKind() {
+        XCTAssertEqual(TBConnectionPathKind.thunderbolt.transportKind, .thunderboltBridge)
+        XCTAssertEqual(TBConnectionPathKind.usb.transportKind, .directUSB)
+        XCTAssertEqual(TBConnectionPathKind.ethernet.transportKind, .networkLink)
+        XCTAssertEqual(TBConnectionPathKind.wifi.transportKind, .networkLink)
+    }
 }

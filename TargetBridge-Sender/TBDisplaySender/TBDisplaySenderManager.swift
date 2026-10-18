@@ -6,6 +6,7 @@ import Network
 
 enum TBTransportKind: String, CaseIterable, Identifiable {
     case thunderboltBridge
+    case directUSB
     case networkLink
 
     var id: String { rawValue }
@@ -17,6 +18,11 @@ enum TBTransportKind: String, CaseIterable, Identifiable {
         case (.thunderboltBridge, .german): return "Thunderbolt Bridge"
         case (.thunderboltBridge, .french): return "Thunderbolt Bridge"
         case (.thunderboltBridge, .chinese): return "Thunderbolt Bridge"
+        case (.directUSB, .italian): return "Direct USB"
+        case (.directUSB, .english): return "Direct USB"
+        case (.directUSB, .german): return "Direct USB"
+        case (.directUSB, .french): return "Direct USB"
+        case (.directUSB, .chinese): return "USB 直连"
         case (.networkLink, .italian): return "Network Link (sperimentale)"
         case (.networkLink, .english): return "Network Link (experimental)"
         case (.networkLink, .german): return "Network Link (experimentell)"
@@ -212,7 +218,7 @@ final class TBDisplaySenderService: ObservableObject {
     var availableTransportKinds: [TBTransportKind] {
         TBTransportKind.allCases.filter { transportKind in
             switch transportKind {
-            case .thunderboltBridge:
+            case .thunderboltBridge, .directUSB:
                 return true
             case .networkLink:
                 return isAddonCapabilityEnabled(.networkLink)

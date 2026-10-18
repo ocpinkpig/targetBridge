@@ -92,6 +92,8 @@ struct TBDiscoveredReceiver: Identifiable, Equatable {
         switch transportKind {
         case .thunderboltBridge:
             return !thunderboltIP.isEmpty ? thunderboltIP : preferredIP
+        case .directUSB:
+            return !usbIP.isEmpty ? usbIP : preferredIP
         case .networkLink:
             if localInterfaceIP.hasPrefix("169.254."), !usbIP.isEmpty {
                 return usbIP

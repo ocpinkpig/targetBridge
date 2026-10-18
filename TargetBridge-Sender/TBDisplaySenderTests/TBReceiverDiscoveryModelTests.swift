@@ -47,6 +47,21 @@ final class TBReceiverDiscoveryModelTests: XCTestCase {
         XCTAssertEqual(receiver.ip(for: .thunderboltBridge), "192.168.1.64")
     }
 
+    func testDirectUSBUsesAdvertisedUSBIP() {
+        let receiver = makeReceiver(preferredIP: "192.168.1.64", usbIP: "169.254.189.3", networkIP: "192.168.1.64")
+        XCTAssertEqual(receiver.ip(for: .directUSB), "169.254.189.3")
+    }
+
+    func testDirectUSBFallsBackToPreferredIP() {
+        let receiver = makeReceiver(preferredIP: "169.254.89.80", usbIP: "")
+        XCTAssertEqual(receiver.ip(for: .directUSB), "169.254.89.80")
+    }
+
+    func testLegacyNetworkLinkLinkLocalStillResolvesUSBIP() {
+        let receiver = makeReceiver(preferredIP: "192.168.1.64", usbIP: "169.254.189.3", networkIP: "192.168.1.64")
+        XCTAssertEqual(receiver.ip(for: .networkLink, localInterfaceIP: "169.254.190.84"), "169.254.189.3")
+    }
+
     func testNetworkTransportPrefersNetworkIP() {
         let receiver = makeReceiver(preferredIP: "169.254.89.80", thunderboltIP: "169.254.89.80", networkIP: "192.168.1.64")
         XCTAssertEqual(receiver.ip(for: .networkLink), "192.168.1.64")

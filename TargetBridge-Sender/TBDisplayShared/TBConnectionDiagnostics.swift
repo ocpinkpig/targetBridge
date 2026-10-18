@@ -49,7 +49,11 @@ enum TBConnectionPathKind: String, CaseIterable {
     case wifi
 
     var transportKind: TBTransportKind {
-        self == .thunderbolt ? .thunderboltBridge : .networkLink
+        switch self {
+        case .thunderbolt: return .thunderboltBridge
+        case .usb: return .directUSB
+        case .ethernet, .wifi: return .networkLink
+        }
     }
 
     fileprivate var tieBreakPriority: Int {
