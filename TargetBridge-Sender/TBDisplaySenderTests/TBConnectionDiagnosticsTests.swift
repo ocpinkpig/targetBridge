@@ -312,4 +312,15 @@ final class TBConnectionDiagnosticsTests: XCTestCase {
     func testEthernetWithoutDHCPIsDirectUSBCandidate() {
         XCTAssertEqual(TBConnectionDiagnostics.transportKind(forInterfaceName: "en0", ip: "169.254.3.4"), .directUSB)
     }
+
+    func testPinsEgressForDirectLinkTransports() {
+        XCTAssertTrue(TBConnectionDiagnostics.shouldPinEgressInterface(transport: .directUSB, interfaceName: "en8"))
+        XCTAssertTrue(TBConnectionDiagnostics.shouldPinEgressInterface(transport: .thunderboltBridge, interfaceName: "bridge0"))
+        XCTAssertFalse(TBConnectionDiagnostics.shouldPinEgressInterface(transport: .networkLink, interfaceName: "en0"))
+    }
+
+    func testPinningIsSkippedWhenInterfaceIsUnknown() {
+        XCTAssertFalse(TBConnectionDiagnostics.shouldPinEgressInterface(transport: .directUSB, interfaceName: nil))
+        XCTAssertFalse(TBConnectionDiagnostics.shouldPinEgressInterface(transport: .directUSB, interfaceName: ""))
+    }
 }

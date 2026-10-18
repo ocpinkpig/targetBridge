@@ -1631,7 +1631,19 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         } else {
             dialHost = NWEndpoint.Host(receiverIP)
         }
-        TBLog.connection.info("connect: dialing \(scopedHost, privacy: .public):\(TBMonitorProtocol.port) from \(self.localInterfaceIP, privacy: .public) (\(self.connectInterfaceName ?? "unknown interface", privacy: .public)) transport=\(self.transportKind.rawValue, privacy: .public)")
+        // Direct links share 169.254/16 with the primary interface; bind the
+        // dial to the link's own interface so it cannot leave via Wi-Fi.
+        var pinnedInterfaceName: String?
+        if TBConnectionDiagnostics.shouldPinEgressInterface(transport: transportKind, interfaceName: connectInterfaceName),
+           let name = connectInterfaceName {
+            if let pinnedInterface = TBNetworkInterfaceCache.shared.interface(named: name) {
+                params.requiredInterface = pinnedInterface
+                pinnedInterfaceName = name
+            } else {
+                TBLog.connection.warning("connect: no NWInterface named \(name, privacy: .public); dialing unpinned")
+            }
+        }
+        TBLog.connection.info("connect: dialing \(scopedHost, privacy: .public):\(TBMonitorProtocol.port) from \(self.localInterfaceIP, privacy: .public) (\(self.connectInterfaceName ?? "unknown interface", privacy: .public)) transport=\(self.transportKind.rawValue, privacy: .public) pinned=\(pinnedInterfaceName ?? "none", privacy: .public)")
         let conn = NWConnection(
             host: dialHost,
             port: NWEndpoint.Port(integerLiteral: TBMonitorProtocol.port),

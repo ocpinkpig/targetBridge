@@ -163,6 +163,14 @@ enum TBConnectionDiagnostics {
         return nil
     }
 
+    /// Direct links (USB-NCM, Thunderbolt Bridge) share 169.254/16 with the primary
+    /// interface, so their dials must be bound to the interface that owns the link.
+    static func shouldPinEgressInterface(transport: TBTransportKind, interfaceName: String?) -> Bool {
+        guard transport == .directUSB || transport == .thunderboltBridge else { return false }
+        guard let interfaceName, !interfaceName.isEmpty else { return false }
+        return true
+    }
+
     static func isIPv4LinkLocal(_ ip: String) -> Bool {
         let octets = ipv4Octets(ip)
         return octets?.count == 4 && octets?[0] == 169 && octets?[1] == 254
@@ -544,5 +552,41 @@ enum TBConnectionDiagnostics {
             interfaces.append(LocalInterface(name: String(cString: iface.pointee.ifa_name), ip: String(cString: buffer)))
         }
         return interfaces
+    }
+}
+
+/// Caches the interfaces Network.framework currently knows about so `connect()`
+/// can resolve an `NWInterface` by name without blocking the main actor.
+final class TBNetworkInterfaceCache: @unchecked Sendable {
+    static let shared = TBNetworkInterfaceCache()
+
+    private let lock = NSLock()
+    private let queue = DispatchQueue(label: "fd.tbdisplaysender.interface-cache", qos: .utility)
+    private var monitor: NWPathMonitor?
+    private var interfaces: [NWInterface] = []
+
+    private init() {}
+
+    /// Idempotent; the monitor lives for the lifetime of the app.
+    func start() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard monitor == nil else { return }
+
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let self else { return }
+            self.lock.lock()
+            self.interfaces = path.availableInterfaces
+            self.lock.unlock()
+        }
+        self.monitor = monitor
+        monitor.start(queue: queue)
+    }
+
+    func interface(named name: String) -> NWInterface? {
+        lock.lock()
+        defer { lock.unlock() }
+        return interfaces.first { $0.name == name }
     }
 }

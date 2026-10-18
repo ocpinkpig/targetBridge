@@ -519,6 +519,7 @@ final class TBDisplaySenderService: ObservableObject {
     }
 
     func refreshLocalInterfaces() {
+        TBNetworkInterfaceCache.shared.start()
         localInterfaces = detectLocalInterfaces()
         receiverDiscovery.refresh()
         normalizeSessionInterfaces()
