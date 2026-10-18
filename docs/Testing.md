@@ -110,7 +110,7 @@ Requires two Macs and a USB-C/USB4 cable. Not covered by unit tests.
    `connect: dialing` log line, look for `pinned=en…`:
 
    ```bash
-   log stream --predicate 'subsystem CONTAINS "TargetBridge"'
+   log stream --predicate 'subsystem == "com.targetbridge.sender" AND category == "connection"'
    ```
 
 5. Unplug the cable mid-session; confirm the existing reconnect/failure path.
