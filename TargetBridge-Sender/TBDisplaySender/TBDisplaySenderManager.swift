@@ -264,6 +264,7 @@ final class TBDisplaySenderService: ObservableObject {
             transportIsThunderbolt: session.transportKind == .thunderboltBridge,
             transportIsDirectUSB: session.transportKind == .directUSB,
             localInterfaceName: TBConnectionDiagnostics.interfaceName(forLocalIP: session.localInterfaceIP, in: interfaces),
+            localInterfaceIP: session.localInterfaceIP,
             receiverAddress: session.receiverIP.trimmingCharacters(in: .whitespacesAndNewlines),
             receiverProfileAvailable: session.receiverSupportsHEVCDecodeHint != nil,
             receiverSupportsHEVC: session.receiverSupportsHEVCDecodeHint,
@@ -906,7 +907,7 @@ final class TBDisplaySenderService: ObservableObject {
         let receivers = discoveredReceivers
         let languageCode = language.fileStem
         for receiver in receivers {
-            let candidateIPs = [receiver.preferredIP, receiver.thunderboltIP, receiver.networkIP]
+            let candidateIPs = [receiver.preferredIP, receiver.thunderboltIP, receiver.usbIP, receiver.networkIP]
             var sentTo = Set<String>()
             for ip in candidateIPs where !ip.isEmpty && sentTo.insert(ip).inserted {
                 sendLanguageUpdate(to: ip, languageCode: languageCode)

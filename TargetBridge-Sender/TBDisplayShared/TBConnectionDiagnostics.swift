@@ -156,6 +156,7 @@ enum TBConnectionDiagnostics {
         if isDirectLinkInterface(name: name, ip: ip) {
             return .directUSB
         }
+        // bridge* + private IP covers macOS Internet Sharing (bridge100).
         if name.hasPrefix("en") || name.hasPrefix("eth") || name.hasPrefix("bridge"),
            isPrivateIPv4(ip) {
             return .networkLink
@@ -582,6 +583,12 @@ final class TBNetworkInterfaceCache: @unchecked Sendable {
         }
         self.monitor = monitor
         monitor.start(queue: queue)
+    }
+
+    var isPopulated: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !interfaces.isEmpty
     }
 
     func interface(named name: String) -> NWInterface? {

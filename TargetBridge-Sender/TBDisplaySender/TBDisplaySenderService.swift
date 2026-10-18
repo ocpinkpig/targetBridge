@@ -1640,7 +1640,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 params.requiredInterface = pinnedInterface
                 pinnedInterfaceName = name
             } else {
-                TBLog.connection.warning("connect: no NWInterface named \(name, privacy: .public); dialing unpinned")
+                let reason = TBNetworkInterfaceCache.shared.isPopulated ? "interface absent" : "cache not yet populated"
+                TBLog.connection.warning("connect: no NWInterface named \(name, privacy: .public) (\(reason, privacy: .public)); dialing unpinned")
             }
         }
         TBLog.connection.info("connect: dialing \(scopedHost, privacy: .public):\(TBMonitorProtocol.port) from \(self.localInterfaceIP, privacy: .public) (\(self.connectInterfaceName ?? "unknown interface", privacy: .public)) transport=\(self.transportKind.rawValue, privacy: .public) pinned=\(pinnedInterfaceName ?? "none", privacy: .public)")
