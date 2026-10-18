@@ -511,9 +511,16 @@ enum TBSenderAutomation {
     }
 
     static func parseTransport(_ value: String) -> TBTransportKind {
-        switch value.lowercased() {
+        switch value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "-", with: "")
+            .replacingOccurrences(of: "_", with: "") {
         case "net", "network", "networklink", "link":
             return .networkLink
+        case "usb", "usb4", "usbc", "directusb":
+            return .directUSB
         default:
             return .thunderboltBridge
         }
