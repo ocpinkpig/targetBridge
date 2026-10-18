@@ -968,16 +968,8 @@ final class TBDisplaySenderService: ObservableObject {
                 NI_NUMERICHOST
             ) == 0 else { continue }
             let ip = String(cString: buffer)
-            if name.hasPrefix("bridge"), ip.hasPrefix("169.254.") {
-                interfaces.append(TBLocalLinkInterface(name: name, ip: ip, transportKind: .thunderboltBridge))
-                continue
-            }
-
-            guard isLikelyLocalNetworkInterfaceName(name),
-                  isLikelyLANIPv4(ip)
-            else { continue }
-
-            interfaces.append(TBLocalLinkInterface(name: name, ip: ip, transportKind: .networkLink))
+            guard let transportKind = TBConnectionDiagnostics.transportKind(forInterfaceName: name, ip: ip) else { continue }
+            interfaces.append(TBLocalLinkInterface(name: name, ip: ip, transportKind: transportKind))
         }
 
         return interfaces.sorted {
@@ -989,31 +981,5 @@ final class TBDisplaySenderService: ObservableObject {
             }
             return $0.transportKind.rawValue < $1.transportKind.rawValue
         }
-    }
-
-    private func isLikelyLocalNetworkInterfaceName(_ name: String) -> Bool {
-        if name.hasPrefix("lo") || name.hasPrefix("utun") || name.hasPrefix("awdl") || name.hasPrefix("llw") {
-            return false
-        }
-        return name.hasPrefix("en")
-            || name.hasPrefix("eth")
-            || name.hasPrefix("bridge")
-    }
-
-    private func isLikelyLANIPv4(_ ip: String) -> Bool {
-        if ip.hasPrefix("169.254.") || ip.hasPrefix("127.") {
-            return false
-        }
-        if ip.hasPrefix("10.") || ip.hasPrefix("192.168.") {
-            return true
-        }
-        let components = ip.split(separator: ".")
-        guard components.count == 4,
-              let first = Int(components[0]),
-              let second = Int(components[1])
-        else {
-            return false
-        }
-        return first == 172 && (16...31).contains(second)
     }
 }

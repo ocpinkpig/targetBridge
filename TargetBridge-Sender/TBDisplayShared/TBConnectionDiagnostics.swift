@@ -147,6 +147,22 @@ enum TBConnectionDiagnostics {
         return first == 169 && second == 254
     }
 
+    /// Classifies a local interface for the sender's transport picker; nil means
+    /// the interface is not a usable link (loopback, tunnels, AWDL, public IPs).
+    static func transportKind(forInterfaceName name: String, ip: String) -> TBTransportKind? {
+        if name.hasPrefix("bridge"), isIPv4LinkLocal(ip) {
+            return .thunderboltBridge
+        }
+        if isDirectLinkInterface(name: name, ip: ip) {
+            return .directUSB
+        }
+        if name.hasPrefix("en") || name.hasPrefix("eth") || name.hasPrefix("bridge"),
+           isPrivateIPv4(ip) {
+            return .networkLink
+        }
+        return nil
+    }
+
     static func isIPv4LinkLocal(_ ip: String) -> Bool {
         let octets = ipv4Octets(ip)
         return octets?.count == 4 && octets?[0] == 169 && octets?[1] == 254
