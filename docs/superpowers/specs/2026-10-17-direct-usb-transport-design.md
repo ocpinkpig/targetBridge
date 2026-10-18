@@ -49,7 +49,9 @@ The sender GUI, however, cannot select it:
   `directUSB` falls back to its default via the existing
   `TBTransportKind(rawValue:)` guard.
 - Extract interface classification from the private `getifaddrs` loop into a
-  pure, testable `static func transportKind(forInterfaceName:ip:) -> TBTransportKind?`:
+  pure, testable `static func TBConnectionDiagnostics.transportKind(forInterfaceName:ip:) -> TBTransportKind?`
+  (in the shared file, next to `isDirectLinkInterface`; it replaces the
+  sender's private `isLikelyLANIPv4`, which matches `isPrivateIPv4`):
   - `bridge*` + `169.254.*` → `.thunderboltBridge` (unchanged)
   - `TBConnectionDiagnostics.isDirectLinkInterface(name:ip:)` (i.e. `en*`/`eth*`
     + valid `169.254.*`) → `.directUSB`
@@ -68,11 +70,11 @@ The sender GUI, however, cannot select it:
 - `TBDiscoveredReceiver.ip(for: .directUSB)` → `usbIP`, falling back to
   `preferredIP` when empty. The existing `.networkLink` +
   `169.254` local IP → `usbIP` mapping stays for older saved sessions.
-- New helper in `TBConnectionDiagnostics`:
-  `static func networkInterface(named:) -> NWInterface?` — takes a one-shot
-  `NWPathMonitor` snapshot (`currentPath.availableInterfaces`), returns the
-  interface whose `name` matches, then cancels the monitor. Network.framework
-  has no lookup-by-name API, hence the helper.
+- New `TBNetworkInterfaceCache` (in `TBConnectionDiagnostics.swift`): one
+  long-lived `NWPathMonitor`, started from `refreshLocalInterfaces()`, that
+  caches `availableInterfaces`; `interface(named:) -> NWInterface?` looks up by
+  name. A one-shot monitor would not work: it has no interfaces until its
+  first asynchronous update, and Network.framework has no lookup-by-name API.
 - In `TBDisplaySenderSession.connect()`, after `connectInterfaceName` is
   resolved: when `transportKind` is `.directUSB` or `.thunderboltBridge` and an
   `NWInterface` matches, set `params.requiredInterface`. Log the pinned
@@ -86,8 +88,11 @@ The sender GUI, however, cannot select it:
   `TBTransportKind.allCases`, so Direct USB appears automatically; the local
   interface picker already filters by `availableInterfaces(for:)`. Extend the
   transport help text (5 languages) with one sentence on Direct USB.
-- `TBDisplaySenderSettingsView` per-transport switch (≈ line 530) gains
-  `.directUSB` rows.
+- `TBDisplaySenderService.availableTransportKinds` returns `.directUSB`
+  unconditionally. Unlike Network Link it is not gated behind an addon
+  capability; it is a direct cable like Thunderbolt Bridge.
+  (`TBDisplaySenderSettingsView`'s `.networkLink` rows are addon
+  capabilities, not transports, and stay untouched.)
 - `TBSenderAutomation.parseTransport`: `usb`, `usb4`, `usbc`, `directusb`
   (case-insensitive, `-`/`_`/space stripped, matching
   `TBConnectionPathPreference.parse`) → `.directUSB`.
@@ -142,7 +147,6 @@ added to `docs/Testing.md`:
 - `TargetBridge-Sender/TBDisplaySender/TBDisplaySenderService.swift`
 - `TargetBridge-Sender/TBDisplaySender/TBReceiverDiscovery.swift`
 - `TargetBridge-Sender/TBDisplaySender/TBDisplaySenderAutomation.swift`
-- `TargetBridge-Sender/TBDisplaySender/TBDisplaySenderSettingsView.swift`
 - `TargetBridge-Sender/TBDisplaySender/TBDisplaySenderContentView.swift`
 - `TargetBridge-Sender/TBDisplaySender/TBConfigurationDiagnostics.swift`
 - `TargetBridge-Sender/TBDisplaySender/TBDisplaySenderLocalization.swift` (transport help text, if needed)
