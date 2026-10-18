@@ -262,6 +262,7 @@ final class TBDisplaySenderService: ObservableObject {
         let snapshot = TBConfigurationDiagnosticSnapshot(
             hasScreenRecording: CGPreflightScreenCaptureAccess(),
             transportIsThunderbolt: session.transportKind == .thunderboltBridge,
+            transportIsDirectUSB: session.transportKind == .directUSB,
             localInterfaceName: TBConnectionDiagnostics.interfaceName(forLocalIP: session.localInterfaceIP, in: interfaces),
             receiverAddress: session.receiverIP.trimmingCharacters(in: .whitespacesAndNewlines),
             receiverProfileAvailable: session.receiverSupportsHEVCDecodeHint != nil,

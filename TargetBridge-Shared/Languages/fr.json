@@ -93,6 +93,8 @@
   "sender.diagnostics.local_link_missing": "Choisissez une interface locale active avant de vous connecter.",
   "sender.diagnostics.thunderbolt_link_ready": "Thunderbolt Bridge est sélectionné sur %{interface}.",
   "sender.diagnostics.thunderbolt_link_unexpected": "Thunderbolt Bridge est sélectionné, mais %{interface} n’est pas une interface bridge.",
+  "sender.diagnostics.usb_link_ready": "Direct USB est sélectionné sur %{interface}.",
+  "sender.diagnostics.usb_link_unexpected": "Direct USB attend une interface réseau USB (en…), mais %{interface} est sélectionnée.",
   "sender.diagnostics.network_link_selected": "Network Link est sélectionné sur %{interface} ; la latence peut varier.",
   "sender.diagnostics.receiver_address": "Adresse du receiver",
   "sender.diagnostics.receiver_address_missing": "Saisissez ou sélectionnez une adresse de receiver.",

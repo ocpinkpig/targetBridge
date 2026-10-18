@@ -93,6 +93,8 @@
   "sender.diagnostics.local_link_missing": "请先选择一个有效的本地接口再连接。",
   "sender.diagnostics.thunderbolt_link_ready": "已在 %{interface} 上选择 Thunderbolt Bridge。",
   "sender.diagnostics.thunderbolt_link_unexpected": "已选择 Thunderbolt Bridge，但 %{interface} 不是 bridge 接口。",
+  "sender.diagnostics.usb_link_ready": "已在 %{interface} 上选择 USB 直连。",
+  "sender.diagnostics.usb_link_unexpected": "USB 直连需要 USB 网络接口（en…），但当前选择的是 %{interface}。",
   "sender.diagnostics.network_link_selected": "已在 %{interface} 上选择 Network Link；延迟可能会变化。",
   "sender.diagnostics.receiver_address": "Receiver 地址",
   "sender.diagnostics.receiver_address_missing": "请输入或选择 receiver 地址。",
