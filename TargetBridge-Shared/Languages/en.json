@@ -59,6 +59,8 @@
   "sender.mode_line_5": "Choose the source, then balance motion and clarity with the stream profile.",
   "sender.toggle.show_menu_bar_icon": "Show icon in top bar",
   "sender.toggle.large_cursor": "Large cursor on receiver",
+  "sender.toggle.low_latency_cursor": "Low-latency cursor when the receiver controls this Mac",
+  "sender.toggle.low_latency_cursor_help": "The receiver draws the cursor itself, so it follows its mouse without video delay. Some special cursor shapes show as an arrow.",
   "sender.toggle.prevent_display_sleep": "Prevent screensaver / display sleep while streaming",
   "sender.toggle.auto_restart_on_wake": "Auto-restart capture after wake / unlock",
   "sender.toggle.stream_audio": "Stream audio",

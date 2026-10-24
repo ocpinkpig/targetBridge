@@ -59,6 +59,8 @@
   "sender.mode_line_5": "先选择来源，再用码流配置在流畅度与清晰度之间取舍。",
   "sender.toggle.show_menu_bar_icon": "在菜单栏显示图标",
   "sender.toggle.large_cursor": "在接收端使用大光标",
+  "sender.toggle.low_latency_cursor": "接收端控制此 Mac 时使用低延迟光标",
+  "sender.toggle.low_latency_cursor_help": "由接收端自行绘制光标，使其跟随接收端鼠标而无视频延迟。部分特殊光标形状将显示为箭头。",
   "sender.toggle.prevent_display_sleep": "传输期间阻止屏幕保护程序和显示器休眠",
   "sender.toggle.auto_restart_on_wake": "唤醒或解锁后自动重启捕获",
   "sender.toggle.stream_audio": "传输音频",

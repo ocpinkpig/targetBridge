@@ -432,19 +432,33 @@ enum TBInputControlRole: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    func usesLowLatencyCursorOverlay(largeCursorEnabled: Bool) -> Bool {
-        // ScreenCaptureKit preserves every native macOS cursor shape, including
-        // temporary system cursors such as the screenshot crosshair. The custom
-        // overlay is reserved for the explicit large-cursor accessibility option.
-        largeCursorEnabled
+    /// Whether the Receiver draws the cursor itself from 120 Hz position
+    /// packets instead of seeing it inside the video.
+    ///
+    /// The video cursor keeps every native macOS shape (e.g. the screenshot
+    /// crosshair) but arrives only after capture → encode → network → decode,
+    /// which on a 5K stream is long enough that a cursor driven from the
+    /// Receiver's own mouse visibly trails the hand. So receiverMaster uses
+    /// the overlay unless the user opts out; the large cursor always does.
+    func usesLowLatencyCursorOverlay(
+        largeCursorEnabled: Bool,
+        lowLatencyCursorEnabled: Bool
+    ) -> Bool {
+        largeCursorEnabled || (self == .receiverMaster && lowLatencyCursorEnabled)
     }
 
     func changesCursorCaptureMode(
         from previousRole: TBInputControlRole,
-        largeCursorEnabled: Bool
+        largeCursorEnabled: Bool,
+        lowLatencyCursorEnabled: Bool
     ) -> Bool {
-        usesLowLatencyCursorOverlay(largeCursorEnabled: largeCursorEnabled)
-            != previousRole.usesLowLatencyCursorOverlay(largeCursorEnabled: largeCursorEnabled)
+        usesLowLatencyCursorOverlay(
+            largeCursorEnabled: largeCursorEnabled,
+            lowLatencyCursorEnabled: lowLatencyCursorEnabled
+        ) != previousRole.usesLowLatencyCursorOverlay(
+            largeCursorEnabled: largeCursorEnabled,
+            lowLatencyCursorEnabled: lowLatencyCursorEnabled
+        )
     }
 }
 
@@ -1102,6 +1116,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     init(
         language: TBDisplaySenderLanguage,
         largeCursor: Bool,
+        lowLatencyCursor: Bool = true,
         preventDisplaySleep: Bool,
         autoRestartOnWake: Bool,
         audioEnabled: Bool,
@@ -1114,6 +1129,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         self.displayStateText = TBDisplaySenderL10n.displayStateNotAvailable(language)
         self.language = language
         self.largeCursor = largeCursor
+        self.lowLatencyCursor = lowLatencyCursor
         self.preventDisplaySleep = preventDisplaySleep
         self.autoRestartOnWake = autoRestartOnWake
         self.audioEnabled = audioEnabled
@@ -1243,6 +1259,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
     }
     @Published var largeCursor: Bool
+    @Published var lowLatencyCursor: Bool
     @Published var preventDisplaySleep: Bool = true
     @Published var autoRestartOnWake: Bool = true
     @Published var verboseDisplayLogging: Bool = false {
@@ -1295,7 +1312,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         didSet {
             let cursorCaptureModeChanged = inputControlRole.changesCursorCaptureMode(
                 from: oldValue,
-                largeCursorEnabled: largeCursor
+                largeCursorEnabled: largeCursor,
+                lowLatencyCursorEnabled: lowLatencyCursor
             )
             inputRelayActive = (inputControlRole == .senderMaster)
             if inputControlRole != .receiverMaster {
@@ -2815,7 +2833,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             }
 
             let usesCursorOverlay = inputControlRole.usesLowLatencyCursorOverlay(
-                largeCursorEnabled: largeCursor
+                largeCursorEnabled: largeCursor,
+                lowLatencyCursorEnabled: lowLatencyCursor
             )
             let configuration = SCStreamConfiguration()
             configuration.width = preset.width
@@ -2930,7 +2949,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private func startDirectDisplayStream(displayID: CGDirectDisplayID, preset: TBDisplayCapturePreset) async -> Bool {
         guard let pipeline else { return false }
         let usesCursorOverlay = inputControlRole.usesLowLatencyCursorOverlay(
-            largeCursorEnabled: largeCursor
+            largeCursorEnabled: largeCursor,
+            lowLatencyCursorEnabled: lowLatencyCursor
         )
         let codecName = activeCodecName ?? codecName(for: activeCodecType ?? preset.codecType)
         streamResolutionText = TBDisplaySenderL10n.streamSummary(
@@ -3416,7 +3436,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
 
         let usesCursorOverlay = inputControlRole.usesLowLatencyCursorOverlay(
-            largeCursorEnabled: largeCursor
+            largeCursorEnabled: largeCursor,
+            lowLatencyCursorEnabled: lowLatencyCursor
         )
         guard usesCursorOverlay, isStreaming, cursorDisplayID != kCGNullDirectDisplay else { return }
         startCursorUpdates(displayID: cursorDisplayID)

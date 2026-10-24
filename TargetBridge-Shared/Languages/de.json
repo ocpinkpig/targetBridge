@@ -59,6 +59,8 @@
   "sender.mode_line_5": "Quelle wählen, dann Bewegungsfluss und Schärfe mit dem Stream-Profil abstimmen.",
   "sender.toggle.show_menu_bar_icon": "Symbol in Menüleiste anzeigen",
   "sender.toggle.large_cursor": "Großer Zeiger auf dem Empfänger",
+  "sender.toggle.low_latency_cursor": "Zeiger mit geringer Latenz, wenn der Empfänger diesen Mac steuert",
+  "sender.toggle.low_latency_cursor_help": "Der Empfänger zeichnet den Zeiger selbst, sodass er seiner Maus ohne Videoverzögerung folgt. Einige spezielle Zeigerformen erscheinen als Pfeil.",
   "sender.toggle.prevent_display_sleep": "Bildschirmschoner und Display-Ruhezustand beim Streamen verhindern",
   "sender.toggle.auto_restart_on_wake": "Aufnahme nach Aufwachen/Entsperren automatisch neu starten",
   "sender.toggle.stream_audio": "Audio übertragen",
