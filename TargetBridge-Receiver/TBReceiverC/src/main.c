@@ -149,6 +149,8 @@ static void tb_receiver_input_log(const char *fmt, ...) {
     if (!home || !*home) return;
 
     char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s/Library/Application Support/TargetBridge Receiver", home);
+    mkdir(dir, 0755);  /* mkdir is not recursive: create the parent first */
     snprintf(dir, sizeof(dir), "%s/Library/Application Support/TargetBridge Receiver/Logs", home);
     mkdir(dir, 0755);
 
