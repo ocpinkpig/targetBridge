@@ -234,11 +234,23 @@ final class TBMonitorProtocolTests: XCTestCase {
         var cursor = TBMonitorCursor(x: 1, y: 2, width: 2560, height: 1440, visible: true, type: 0, large: false)
         let plain = try XCTUnwrap(String(data: JSONEncoder().encode(cursor), encoding: .utf8))
         XCTAssertFalse(plain.contains("echo"))
+        XCTAssertFalse(plain.contains("point"))
 
         cursor.echo = 987_654_321_012
         let echoed = try JSONEncoder().encode(cursor)
         XCTAssertTrue(try XCTUnwrap(String(data: echoed, encoding: .utf8)).contains("\"echo\":987654321012"))
         XCTAssertEqual(TBMonitorProtocol.decodeJSON(TBMonitorCursor.self, from: echoed)?.echo, 987_654_321_012)
+    }
+
+    func testCursorPointSizeUsesKeysTheReceiverParses() throws {
+        // The Receiver looks fields up by exact key; "pointWidth" must not
+        // collide with its "width" lookup (it searches for "\"width\"").
+        let cursor = TBMonitorCursor(x: 1, y: 2, width: 5120, height: 2880, visible: true, type: 0,
+                                     large: false, pointWidth: 2560, pointHeight: 1440)
+        let json = try XCTUnwrap(String(data: JSONEncoder().encode(cursor), encoding: .utf8))
+        XCTAssertTrue(json.contains("\"pointWidth\":2560"))
+        XCTAssertTrue(json.contains("\"pointHeight\":1440"))
+        XCTAssertTrue(json.contains("\"width\":5120"))
     }
 
     func testReceiverMoveStampDecodes() {

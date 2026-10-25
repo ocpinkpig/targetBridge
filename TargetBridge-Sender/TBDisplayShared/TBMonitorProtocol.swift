@@ -80,6 +80,11 @@ struct TBMonitorCursor: Codable {
     /// The `t` of the receiver move this position answers, echoed unchanged so
     /// the Receiver can time the round trip on its own clock. Omitted otherwise.
     var echo: UInt64? = nil
+    /// Size of the captured display in points: the unit of the Receiver's
+    /// move deltas, so it can predict where a move lands on the stream's
+    /// pixel grid. Omitted on hidden-cursor packets.
+    var pointWidth: Double? = nil
+    var pointHeight: Double? = nil
 }
 
 struct TBMonitorInputEvent: Codable {

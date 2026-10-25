@@ -7,6 +7,7 @@
 #include <stddef.h>
 
 #include "input_queue.h"
+#include "timing_stats.h"
 
 struct tb_display;
 
@@ -60,7 +61,14 @@ void tb_disp_set_cursor(struct tb_display *d,
  * event-loop pass, after reading the socket. */
 void tb_disp_flush_cursor(struct tb_display *d);
 
-/* Read and reset how long cursor updates waited before being presented. */
+/* Read and reset per-frame upload (NV12 → texture) and draw+present times,
+ * in µs. Returns 0 when no frame was rendered since the last call. */
+int tb_disp_take_frame_stats(struct tb_display *d,
+                             struct tb_timing_summary *upload,
+                             struct tb_timing_summary *present);
+
+/* Read and reset how long cursor updates waited before being presented
+ * (SDL-drawn cursor only; the cursor layer does not wait for a present). */
 void tb_disp_take_cursor_draw_stats(struct tb_display *d,
                                     uint64_t *count,
                                     uint64_t *sum_us,

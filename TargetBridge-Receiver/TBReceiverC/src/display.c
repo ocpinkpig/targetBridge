@@ -9,6 +9,7 @@
 #include "display.h"
 #include "tb_i18n.h"
 #include "tb_gesture_bridge.h"
+#include "tb_cursor_layer.h"
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
@@ -50,6 +51,9 @@ struct tb_display {
     int           cursor_visible;
     int           cursor_type;
     int           cursor_large;
+    /* The cursor is a Core Animation layer (tb_cursor_layer.m) rather than
+     * drawn into each frame; the fields below are then unused. */
+    int           cursor_layer;
     /* Cursor moved since the last present; drawn by tb_disp_flush_cursor. */
     int           cursor_dirty;
     uint64_t      cursor_dirty_since_us;
@@ -58,6 +62,9 @@ struct tb_display {
     uint64_t      cursor_draw_count;
     uint64_t      cursor_draw_sum_us;
     uint64_t      cursor_draw_max_us;
+    /* Per video frame: NV12 copy into the texture, then draw + present. */
+    struct tb_timing_stats frame_upload_us;
+    struct tb_timing_stats frame_present_us;
     int           system_cursor_hidden;
 
     char          last_ip[64];
@@ -189,6 +196,17 @@ static uint16_t tb_disp_mac_keycode_for_sdl_scancode(SDL_Scancode scancode) {
 static void tb_disp_queue_input_event(struct tb_display *d, const struct tb_input_event *event) {
     if (!d || !event) return;
     (void)tb_input_queue_push(&d->input_queue, event);
+}
+
+/* Mirrors the cursor state onto the Core Animation layer. It shows only over
+ * video (is_connected), never over the status or connecting screens. */
+static void tb_disp_sync_cursor_layer(struct tb_display *d) {
+    if (!d || !d->cursor_layer) return;
+    const int visible = d->cursor_visible && d->is_connected && d->tex &&
+                        d->cursor_source_w > 0 && d->cursor_source_h > 0;
+    const double x = visible ? (double)d->cursor_x / (double)d->cursor_source_w : 0;
+    const double y = visible ? (double)d->cursor_y / (double)d->cursor_source_h : 0;
+    tb_cursor_layer_update(visible, x, y, d->cursor_type, d->cursor_large);
 }
 
 static void tb_disp_destroy_status_texture(struct tb_display *d) {
@@ -590,6 +608,7 @@ struct tb_display *tb_disp_create(int fullscreen) {
         fprintf(stderr, "[disp] CreateRenderer: %s\n", SDL_GetError());
         SDL_DestroyWindow(d->win); free(d); return NULL;
     }
+    d->cursor_layer = tb_cursor_layer_enabled();
     SDL_SetYUVConversionMode(SDL_YUV_CONVERSION_BT709);
     SDL_RenderSetLogicalSize(d->ren, 0, 0);
 
@@ -631,6 +650,7 @@ struct tb_display *tb_disp_create(int fullscreen) {
 
 void tb_disp_destroy(struct tb_display *d) {
     if (!d) return;
+    if (d->cursor_layer) tb_cursor_layer_destroy();
     if (d->system_cursor_hidden) {
         CGDisplayShowCursor(CGMainDisplayID());
         d->system_cursor_hidden = 0;
@@ -739,7 +759,8 @@ static void draw_scaled_rect(SDL_Renderer *ren, int cx, int cy, int size, int rx
 }
 
 static void tb_disp_draw_cursor(struct tb_display *d) {
-    if (!d || !d->cursor_visible || d->cursor_source_w <= 0 || d->cursor_source_h <= 0) return;
+    if (!d || d->cursor_layer) return;
+    if (!d->cursor_visible || d->cursor_source_w <= 0 || d->cursor_source_h <= 0) return;
 
     int out_w = 0, out_h = 0;
     if (SDL_GetRendererOutputSize(d->ren, &out_w, &out_h) < 0 || out_w <= 0 || out_h <= 0) {
@@ -1151,13 +1172,28 @@ void tb_disp_render_nv12(struct tb_display *d,
     if (tb_disp_ensure_texture(d, w, h) < 0) return;
     tb_disp_set_connection_state(d, 1);
 
+    const uint64_t upload_start = tb_disp_now_us();
     if (SDL_UpdateNVTexture(d->tex, NULL,
                             y,  y_stride,
                             uv, uv_stride) < 0) {
         fprintf(stderr, "[disp] UpdateNVTexture: %s\n", SDL_GetError());
         return;
     }
+    const uint64_t present_start = tb_disp_now_us();
     tb_disp_render_current(d);
+    tb_timing_stats_add_elapsed(&d->frame_upload_us, upload_start, present_start);
+    tb_timing_stats_add_elapsed(&d->frame_present_us, present_start, tb_disp_now_us());
+}
+
+int tb_disp_take_frame_stats(struct tb_display *d,
+                             struct tb_timing_summary *upload,
+                             struct tb_timing_summary *present) {
+    if (!d || !upload || !present) return 0;
+    const int have = tb_timing_stats_take_summary(&d->frame_upload_us, upload);
+    if (!tb_timing_stats_take_summary(&d->frame_present_us, present)) {
+        memset(present, 0, sizeof(*present));
+    }
+    return have;
 }
 
 void tb_disp_set_cursor(struct tb_display *d,
@@ -1174,6 +1210,12 @@ void tb_disp_set_cursor(struct tb_display *d,
     d->cursor_visible = visible;
     d->cursor_type = type;
     d->cursor_large = large;
+
+    if (d->cursor_layer) {
+        /* Moves the layer now; the video frame is not redrawn. */
+        tb_disp_sync_cursor_layer(d);
+        return;
+    }
 
     /* Draw on the next tb_disp_flush_cursor() (or video frame, whichever
      * comes first) instead of here, so a burst of packets read in one socket
@@ -1244,6 +1286,7 @@ unsigned int tb_disp_poll_actions(struct tb_display *d) {
                 else input_event.kind = TB_INPUT_EVENT_MOVE;
                 input_event.dx = ev.motion.xrel;
                 input_event.dy = ev.motion.yrel;
+                input_event.timestamp_ms = ev.motion.timestamp;
                 tb_disp_queue_input_event(d, &input_event);
                 break;
             case SDL_MOUSEWHEEL:
@@ -1411,6 +1454,7 @@ static void tb_disp_set_stream_state(struct tb_display *d, int connected, int co
     d->is_connected = connected;
     d->is_connecting = connecting;
     tb_disp_refresh_window_mode(d);
+    tb_disp_sync_cursor_layer(d);
 }
 
 void tb_disp_set_connection_state(struct tb_display *d, int connected) {

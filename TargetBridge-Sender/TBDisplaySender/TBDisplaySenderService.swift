@@ -3591,7 +3591,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             visible: visible,
             type: type,
             large: large,
-            echo: echo
+            echo: echo,
+            pointWidth: Double(bounds.width),
+            pointHeight: Double(bounds.height)
         )
     }
 

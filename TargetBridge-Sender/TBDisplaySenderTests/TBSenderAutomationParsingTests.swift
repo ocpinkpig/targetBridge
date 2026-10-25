@@ -155,6 +155,9 @@ final class TBSenderAutomationParsingTests: XCTestCase {
         XCTAssertEqual(middle.y, 1440)
         XCTAssertTrue(middle.visible)
         XCTAssertEqual(middle.echo, 42)
+        // The Receiver needs the point size to predict where its moves land.
+        XCTAssertEqual(middle.pointWidth, 2560)
+        XCTAssertEqual(middle.pointHeight, 1440)
 
         // Off the display: hidden, pinned to the nearest edge.
         let off = try XCTUnwrap(TBDisplaySenderSession.cursorPacket(

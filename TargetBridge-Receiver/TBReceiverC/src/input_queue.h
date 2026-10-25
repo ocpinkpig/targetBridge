@@ -36,6 +36,9 @@ struct tb_input_event {
     int scroll_y;
     uint16_t key_code;
     int click_count;
+    /* SDL_GetTicks() time of the SDL event (motion only; 0 = unknown), for
+     * the input-wait latency figure. */
+    uint32_t timestamp_ms;
 };
 
 struct tb_input_queue {
