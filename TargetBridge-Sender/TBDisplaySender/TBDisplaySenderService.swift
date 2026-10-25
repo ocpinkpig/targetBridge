@@ -1323,8 +1323,26 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 remoteHeldModifierKeyCodes.removeAll()
                 suppressedTriggerKeyCode = nil
             }
-            if cursorCaptureModeChanged, isStreaming {
-                restartCaptureNow()
+            if cursorCaptureModeChanged {
+                if !inputControlRole.usesLowLatencyCursorOverlay(
+                    largeCursorEnabled: largeCursor,
+                    lowLatencyCursorEnabled: lowLatencyCursor
+                ) {
+                    // Clear the overlay now rather than after the restart, so
+                    // the Receiver never shows it beside the video cursor.
+                    stopReceiverCursorOverlay()
+                }
+                switch Self.cursorModeRestartAction(
+                    isStreaming: isStreaming,
+                    isRestartingCapture: isRestartingCaptureAfterWake
+                ) {
+                case .restartNow:
+                    restartCaptureNow()
+                case .afterCurrentRestart:
+                    cursorModeRestartPending = true
+                case .none:
+                    break
+                }
             }
         }
     }
@@ -1394,6 +1412,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     var onRemoteDeactivateInputRequest: (() -> Void)?
     nonisolated(unsafe) private var wakeObservers: [NSObjectProtocol] = []
     private var isRestartingCaptureAfterWake = false
+    /// A role change flipped the cursor capture mode while another restart
+    /// was running; restart once more when it finishes.
+    private var cursorModeRestartPending = false
     private var captureRestartGeneration: UInt64 = 0
     private var lastLoggedCaptureHealthState: TBCaptureHealth.State?
     nonisolated(unsafe) private var displayReconfigurationCallbackRegistered = false
@@ -1859,6 +1880,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         let connectionToClose = connection
         captureRestartGeneration &+= 1
         isRestartingCaptureAfterWake = false
+        cursorModeRestartPending = false
         if persistArrangement {
             persistExtendedDisplayArrangementIfNeeded()
         }
@@ -2898,7 +2920,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             try await stream.startCapture()
             scStream = stream
             isStreaming = true
-            if usesCursorOverlay { startCursorUpdates(displayID: display.displayID) }
+            if usesCursorOverlay {
+                startCursorUpdates(displayID: display.displayID)
+            } else {
+                stopReceiverCursorOverlay()
+            }
             beginCaptureActivity(wakeDisplay: false)
             startFPSTimer()
             startCaptureWatchdog()
@@ -2971,7 +2997,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         await startAuxiliaryAudioCapture(preferredDisplayID: displayID)
         captureDisplayText = TBDisplaySenderL10n.captureDisplayCGDisplayStream(language, id: displayID)
         isStreaming = true
-        if usesCursorOverlay { startCursorUpdates(displayID: displayID) }
+        if usesCursorOverlay {
+            startCursorUpdates(displayID: displayID)
+        } else {
+            stopReceiverCursorOverlay()
+        }
         beginCaptureActivity(wakeDisplay: false)
         startFPSTimer()
         startCaptureWatchdog()
@@ -3189,6 +3219,33 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
 
         return false
+    }
+
+    enum CursorModeRestartAction: Equatable {
+        case none
+        case restartNow
+        /// A restart is already running and may have read the old role.
+        case afterCurrentRestart
+    }
+
+    /// What to do when a role change flips whether the video carries the
+    /// cursor. A restart that is already running reads the role before it
+    /// starts the stream, so a change that lands later must not be dropped.
+    static func cursorModeRestartAction(
+        isStreaming: Bool,
+        isRestartingCapture: Bool
+    ) -> CursorModeRestartAction {
+        if isRestartingCapture { return .afterCurrentRestart }
+        return isStreaming ? .restartNow : .none
+    }
+
+    /// The Receiver keeps drawing the last overlay cursor it was sent until it
+    /// gets `visible: false`, so leaving overlay mode has to say so.
+    static func shouldHideReceiverCursorOverlay(
+        usesCursorOverlay: Bool,
+        lastCursorPacket: TBMonitorCursor?
+    ) -> Bool {
+        !usesCursorOverlay && lastCursorPacket?.visible == true
     }
 
     static func shouldUseHeadlessVirtualDisplay(
@@ -3424,6 +3481,19 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         lastCursorPacket = cursor
         if let packet = TBMonitorProtocol.makeJSONPacket(type: .cursor, value: cursor) {
             send(packet)
+        }
+    }
+
+    /// Stops overlay updates and hides any overlay cursor the Receiver is
+    /// still drawing, for a capture mode where the video carries the cursor.
+    private func stopReceiverCursorOverlay() {
+        cursorTimer?.invalidate()
+        cursorTimer = nil
+        if Self.shouldHideReceiverCursorOverlay(
+            usesCursorOverlay: false,
+            lastCursorPacket: lastCursorPacket
+        ) {
+            sendHiddenCursorPacketIfNeeded()
         }
     }
 
@@ -3697,6 +3767,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             defer {
                 if self.captureRestartGeneration == generation {
                     self.isRestartingCaptureAfterWake = false
+                    if self.cursorModeRestartPending {
+                        self.cursorModeRestartPending = false
+                        self.restartCaptureNow()
+                    }
                 }
             }
             // A delayed recovery must never restart a replacement connection,
@@ -3741,7 +3815,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         senderFPS = 0
         sentSnapshot = 0
         cursorDisplayID = kCGNullDirectDisplay
-        lastCursorPacket = nil
+        // Keep lastCursorPacket: if the new stream drops the overlay, it tells
+        // whether the Receiver is still drawing one that must be hidden.
 
         beginCaptureActivity()
         let started = await startCapture(for: profile)

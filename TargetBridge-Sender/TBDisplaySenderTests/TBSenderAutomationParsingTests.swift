@@ -127,6 +127,70 @@ final class TBSenderAutomationParsingTests: XCTestCase {
                 from: .off, largeCursorEnabled: true, lowLatencyCursorEnabled: true
             )
         )
+        // receiverMaster ↔ senderMaster also flips the video cursor.
+        XCTAssertTrue(
+            TBInputControlRole.senderMaster.changesCursorCaptureMode(
+                from: .receiverMaster, largeCursorEnabled: false, lowLatencyCursorEnabled: true
+            )
+        )
+        XCTAssertTrue(
+            TBInputControlRole.receiverMaster.changesCursorCaptureMode(
+                from: .senderMaster, largeCursorEnabled: false, lowLatencyCursorEnabled: true
+            )
+        )
+    }
+
+    private func cursorPacket(visible: Bool) -> TBMonitorCursor {
+        TBMonitorCursor(x: 10, y: 20, width: 1920, height: 1080, visible: visible, type: 0, large: false)
+    }
+
+    func testLeavingOverlayModeHidesTheReceiverOverlayCursor() {
+        // The Receiver keeps drawing the last overlay cursor until told
+        // visible=false; without it a frozen arrow sits beside the video cursor.
+        XCTAssertTrue(
+            TBDisplaySenderSession.shouldHideReceiverCursorOverlay(
+                usesCursorOverlay: false, lastCursorPacket: cursorPacket(visible: true)
+            )
+        )
+        // Already hidden, or never shown: nothing to send.
+        XCTAssertFalse(
+            TBDisplaySenderSession.shouldHideReceiverCursorOverlay(
+                usesCursorOverlay: false, lastCursorPacket: cursorPacket(visible: false)
+            )
+        )
+        XCTAssertFalse(
+            TBDisplaySenderSession.shouldHideReceiverCursorOverlay(
+                usesCursorOverlay: false, lastCursorPacket: nil
+            )
+        )
+        // Overlay still in use: the next update packet replaces it.
+        XCTAssertFalse(
+            TBDisplaySenderSession.shouldHideReceiverCursorOverlay(
+                usesCursorOverlay: true, lastCursorPacket: cursorPacket(visible: true)
+            )
+        )
+    }
+
+    func testCursorModeRestartIsDeferredWhileAnotherRestartRuns() {
+        XCTAssertEqual(
+            TBDisplaySenderSession.cursorModeRestartAction(isStreaming: true, isRestartingCapture: false),
+            .restartNow
+        )
+        // A running restart may already have read the old role, so the
+        // change must be queued, not dropped. Mid-teardown isStreaming is false.
+        XCTAssertEqual(
+            TBDisplaySenderSession.cursorModeRestartAction(isStreaming: true, isRestartingCapture: true),
+            .afterCurrentRestart
+        )
+        XCTAssertEqual(
+            TBDisplaySenderSession.cursorModeRestartAction(isStreaming: false, isRestartingCapture: true),
+            .afterCurrentRestart
+        )
+        // Not streaming: the next capture start reads the new role anyway.
+        XCTAssertEqual(
+            TBDisplaySenderSession.cursorModeRestartAction(isStreaming: false, isRestartingCapture: false),
+            .none
+        )
     }
 
     func testNativeScaleAppliesOnlyToPanelMatchedProfiles() {
