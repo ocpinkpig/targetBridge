@@ -134,7 +134,7 @@ struct app {
     struct tb_timing_stats cursor_rtt_us;
     struct tb_timing_stats input_wait_us;
     struct tb_timing_stats predict_error_tenths_pt;
-    struct tb_timing_stats frame_total_us;
+    struct tb_timing_stats frame_decode_us;
     uint64_t last_latency_report_ms;
     uint64_t last_target_switch_ms;
     uint64_t last_space_switch_ms;
@@ -1230,22 +1230,20 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
         tb_dec_set_param_sets(a->dec, payload, len);
         break;
     case TB_PKT_FRAME:
-    case TB_PKT_RAW_FRAME:
         {
-            /* Whole cost of a frame on this thread: decode (encoded only),
-             * NV12 upload and present. The display splits out the last two. */
+            /* Decode only; the newest frame is shown once per socket read
+             * (tb_dec_present_latest). */
             const uint64_t start = now_us();
-            const uint64_t frames_before = a->frames;
             a->session_active = 1;
-            if (type == TB_PKT_FRAME) {
-                tb_dec_feed_frame(a->dec, payload, len);
-            } else {
-                handle_raw_frame(a, payload, len);
-            }
-            if (a->frames != frames_before) {
-                tb_timing_stats_add_elapsed(&a->frame_total_us, start, now_us());
-            }
+            tb_dec_feed_frame(a->dec, payload, len);
+            tb_timing_stats_add_elapsed(&a->frame_decode_us, start, now_us());
         }
+        break;
+    case TB_PKT_RAW_FRAME:
+        /* Uncompressed frames point into the packet buffer, so they are shown
+         * immediately rather than deferred like decoded ones. */
+        a->session_active = 1;
+        handle_raw_frame(a, payload, len);
         break;
     case TB_PKT_CURSOR:
         {
@@ -1383,10 +1381,16 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
 
 /* ---- Networking helpers ---------------------------------------------- */
 
+/* Longest one drain may spend reading and decoding before the loop shows the
+ * newest frame and sends input again; anything left is read next pass. */
+#define TB_DRAIN_BUDGET_US 16000
+
 static int drain_socket(struct app *a) {
     uint8_t buf[1024 * 1024];
     int saw_data = 0;
+    const uint64_t started = now_us();
     for (;;) {
+        if (saw_data && now_us() - started >= TB_DRAIN_BUDGET_US) return saw_data;
         ssize_t n = read(a->client_fd, buf, sizeof(buf));
         if (n > 0) {
             saw_data = 1;
@@ -2372,6 +2376,9 @@ int main(int argc, char **argv) {
                 close_client(&a);
             } else {
                 socket_activity = drain_result;
+                /* Show only the newest frame this drain decoded: when behind,
+                 * older ones are skipped rather than queued (5K 60 lag). */
+                tb_dec_present_latest(a.dec);
                 /* Show a cursor move now rather than with the next video
                  * frame, which only comes when the screen content changes. */
                 tb_disp_flush_cursor(a.disp);
@@ -2441,18 +2448,36 @@ int main(int argc, char **argv) {
          *             predict = how far prediction was off when confirmed;
          *             draw    = cursor packet → presented (SDL-drawn cursor
          *                       only; the layer shows immediately).
-         *   [frames]  total   = decode + upload + present per video frame,
-         *             with upload (NV12 → texture) and present split out. */
+         *   [frames]  decoded/shown/skipped per second (skipped = replaced
+         *             by a newer frame before it could be shown, i.e. the
+         *             receiver was behind), then decode, upload (NV12 →
+         *             texture) and present time per frame. Also logged
+         *             whenever frames were skipped. */
         if (t - a.last_latency_report_ms >= 1000) {
             a.last_latency_report_ms = t;
-            struct tb_timing_summary rtt, wait, predict, total, upload, present;
+            struct tb_timing_summary rtt, wait, predict, decode, upload, present;
             uint64_t draws = 0, draw_sum_us = 0, draw_max_us = 0;
+            uint64_t decoded = 0, skipped = 0;
             tb_disp_take_cursor_draw_stats(a.disp, &draws, &draw_sum_us, &draw_max_us);
+            tb_dec_take_counts(a.dec, &decoded, &skipped);
             const int have_rtt = tb_timing_stats_take_summary(&a.cursor_rtt_us, &rtt);
             const int have_wait = tb_timing_stats_take_summary(&a.input_wait_us, &wait);
             const int have_predict = tb_timing_stats_take_summary(&a.predict_error_tenths_pt, &predict);
-            const int have_total = tb_timing_stats_take_summary(&a.frame_total_us, &total);
+            const int have_decode = tb_timing_stats_take_summary(&a.frame_decode_us, &decode);
             const int have_split = tb_disp_take_frame_stats(a.disp, &upload, &present);
+            if ((have_decode || have_split) && (have_rtt || have_wait || skipped > 0)) {
+                char decode_text[96] = "-", upload_text[96] = "-", present_text[96] = "-";
+                if (have_decode) tb_format_timing_ms(decode_text, sizeof(decode_text), &decode);
+                if (have_split) {
+                    tb_format_timing_ms(upload_text, sizeof(upload_text), &upload);
+                    tb_format_timing_ms(present_text, sizeof(present_text), &present);
+                }
+                tb_receiver_input_log("[frames] decoded=%llu shown=%llu skipped=%llu | decode %s | upload %s | present %s",
+                                      (unsigned long long)decoded,
+                                      (unsigned long long)(have_split ? upload.count : 0),
+                                      (unsigned long long)skipped,
+                                      decode_text, upload_text, present_text);
+            }
             if (have_rtt || have_wait) {
                 char rtt_text[96] = "-", wait_text[96] = "-", predict_text[96] = "off", draw_text[64] = "layer";
                 if (have_rtt) tb_format_timing_ms(rtt_text, sizeof(rtt_text), &rtt);
@@ -2469,16 +2494,6 @@ int main(int argc, char **argv) {
                 }
                 tb_receiver_input_log("[latency] rtt %s | wait %s | predict %s | draw %s",
                                       rtt_text, wait_text, predict_text, draw_text);
-                if (have_total) {
-                    char total_text[96], upload_text[96] = "-", present_text[96] = "-";
-                    tb_format_timing_ms(total_text, sizeof(total_text), &total);
-                    if (have_split) {
-                        tb_format_timing_ms(upload_text, sizeof(upload_text), &upload);
-                        tb_format_timing_ms(present_text, sizeof(present_text), &present);
-                    }
-                    tb_receiver_input_log("[frames] total %s | upload %s | present %s",
-                                          total_text, upload_text, present_text);
-                }
             }
         }
 

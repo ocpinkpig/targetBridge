@@ -34,7 +34,17 @@ void               tb_dec_reset  (struct tb_decoder *d);
 int  tb_dec_set_param_sets(struct tb_decoder *d, const uint8_t *payload, size_t len);
 
 /* Feed one AVCC-formatted frame (4-byte length prefixed NAL units).
- * Converts to Annex B and dispatches to FFmpeg. */
+ * Converts to Annex B and decodes it. Decoded pictures are not shown here:
+ * only the newest is kept, for tb_dec_present_latest(). */
 int  tb_dec_feed_frame(struct tb_decoder *d, const uint8_t *avcc, size_t len);
+
+/* Hands the newest decoded frame (if any) to the frame callback and drops
+ * it. Call once after reading the socket, so a backlog of frames costs one
+ * upload + present instead of one each. Returns 1 if a frame was shown. */
+int  tb_dec_present_latest(struct tb_decoder *d);
+
+/* Read and reset: frames decoded, and frames replaced by a newer one before
+ * they could be shown (the receiver was behind). */
+void tb_dec_take_counts(struct tb_decoder *d, uint64_t *decoded, uint64_t *replaced);
 
 #endif
