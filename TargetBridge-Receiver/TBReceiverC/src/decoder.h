@@ -38,10 +38,18 @@ int  tb_dec_set_param_sets(struct tb_decoder *d, const uint8_t *payload, size_t 
  * only the newest is kept, for tb_dec_present_latest(). */
 int  tb_dec_feed_frame(struct tb_decoder *d, const uint8_t *avcc, size_t len);
 
+/* Threading: set_param_sets, feed_frame and reset run on one decoding
+ * thread (decode_thread.c); present_latest runs on the presenting (main)
+ * thread and calls the frame callback there. drop_latest and take_counts
+ * may be called from either. */
+
 /* Hands the newest decoded frame (if any) to the frame callback and drops
- * it. Call once after reading the socket, so a backlog of frames costs one
- * upload + present instead of one each. Returns 1 if a frame was shown. */
+ * it. Call once per loop pass, so a backlog of frames costs one upload +
+ * present instead of one each. Returns 1 if a frame was shown. */
 int  tb_dec_present_latest(struct tb_decoder *d);
+
+/* Forgets the newest decoded frame without showing it (session ended). */
+void tb_dec_drop_latest(struct tb_decoder *d);
 
 /* Read and reset: frames decoded, and frames replaced by a newer one before
  * they could be shown (the receiver was behind). */

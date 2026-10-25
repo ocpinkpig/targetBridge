@@ -13,6 +13,7 @@
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,11 +48,16 @@ struct tb_decoder {
     tb_frame_cb       cb;
     void             *ud;
 
-    /* Newest decoded frame not shown yet (see tb_dec_present_latest). */
+    /* Newest decoded frame not shown yet (see tb_dec_present_latest).
+     * Decoding may run on another thread than presenting, so these four
+     * are only touched under latest_lock. */
+    pthread_mutex_t   latest_lock;
     AVFrame          *latest;
     int               has_latest;
     uint64_t          decoded;
     uint64_t          replaced;
+    /* Presenting side only: the frame being handed to the callback. */
+    AVFrame          *presenting;
 
     int               opened;
 };
@@ -101,8 +107,10 @@ struct tb_decoder *tb_dec_create(tb_frame_cb cb, void *ud) {
     d->sw_frame = av_frame_alloc();
     d->nv12_frame = av_frame_alloc();
     d->latest   = av_frame_alloc();
+    d->presenting = av_frame_alloc();
     d->pkt      = av_packet_alloc();
-    if (!d->hw_frame || !d->sw_frame || !d->nv12_frame || !d->latest || !d->pkt) {
+    pthread_mutex_init(&d->latest_lock, NULL);
+    if (!d->hw_frame || !d->sw_frame || !d->nv12_frame || !d->latest || !d->presenting || !d->pkt) {
         tb_dec_destroy(d); return NULL;
     }
     return d;
@@ -145,8 +153,7 @@ void tb_dec_reset(struct tb_decoder *d) {
     d->extradata_size = 0;
     d->opened         = 0;
     /* A frame from the previous session must never be shown in the next. */
-    if (d->latest) av_frame_unref(d->latest);
-    d->has_latest     = 0;
+    tb_dec_drop_latest(d);
     /* hw_dev, hw_frame, sw_frame, pkt stay allocated for reuse. */
 }
 
@@ -158,6 +165,8 @@ void tb_dec_destroy(struct tb_decoder *d) {
     if (d->sw_frame) av_frame_free(&d->sw_frame);
     if (d->nv12_frame) av_frame_free(&d->nv12_frame);
     if (d->latest)   av_frame_free(&d->latest);
+    if (d->presenting) av_frame_free(&d->presenting);
+    pthread_mutex_destroy(&d->latest_lock);
     if (d->pkt)      av_packet_free(&d->pkt);
     if (d->sws)      sws_freeContext(d->sws);
     av_free(d->extradata);   /* allocated with av_malloc */
@@ -378,28 +387,48 @@ int tb_dec_feed_frame(struct tb_decoder *d, const uint8_t *avcc, size_t len) {
          * that would be replaced before the next present cost a decode but
          * no NV12 upload or present, so the receiver catches up instead of
          * building a standing queue. */
+        pthread_mutex_lock(&d->latest_lock);
         if (d->has_latest) d->replaced++;
         av_frame_unref(d->latest);
         av_frame_move_ref(d->latest, d->hw_frame);
         d->has_latest = 1;
         d->decoded++;
+        pthread_mutex_unlock(&d->latest_lock);
     }
 }
 
 int tb_dec_present_latest(struct tb_decoder *d) {
-    if (!d || !d->has_latest) return 0;
-    d->has_latest = 0;
-    tb_dec_emit(d, d->latest);
-    av_frame_unref(d->latest);
+    if (!d) return 0;
+    pthread_mutex_lock(&d->latest_lock);
+    const int have = d->has_latest;
+    if (have) {
+        av_frame_move_ref(d->presenting, d->latest);
+        d->has_latest = 0;
+    }
+    pthread_mutex_unlock(&d->latest_lock);
+    if (!have) return 0;
+    /* Outside the lock: the upload must not stall the decoding thread. */
+    tb_dec_emit(d, d->presenting);
+    av_frame_unref(d->presenting);
     return 1;
+}
+
+void tb_dec_drop_latest(struct tb_decoder *d) {
+    if (!d || !d->latest) return;
+    pthread_mutex_lock(&d->latest_lock);
+    av_frame_unref(d->latest);
+    d->has_latest = 0;
+    pthread_mutex_unlock(&d->latest_lock);
 }
 
 void tb_dec_take_counts(struct tb_decoder *d, uint64_t *decoded, uint64_t *replaced) {
     if (!d) return;
+    pthread_mutex_lock(&d->latest_lock);
     if (decoded) *decoded = d->decoded;
     if (replaced) *replaced = d->replaced;
     d->decoded = 0;
     d->replaced = 0;
+    pthread_mutex_unlock(&d->latest_lock);
 }
 
 /* Hands one decoded frame to the frame callback as NV12 planes. */
@@ -410,7 +439,7 @@ static void tb_dec_emit(struct tb_decoder *d, AVFrame *frame) {
      * access to the IOSurface-backed NV12 planes without the
      * GPU→staging→CPU copy that av_hwframe_transfer_data performs.
      * Major win on Intel iMac + Radeon (~6× faster in practice). */
-    if (frame->format == d->hw_pix_fmt && frame->data[3]) {
+    if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX && frame->data[3]) {
         CVPixelBufferRef pb = (CVPixelBufferRef)frame->data[3];
         if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) == 0) {
             uint8_t *y   = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
@@ -428,7 +457,9 @@ static void tb_dec_emit(struct tb_decoder *d, AVFrame *frame) {
 
     /* Generic path: HW transfer (Linux VAAPI / Windows D3D11VA / SW). */
     AVFrame *out = frame;
-    if (frame->format == d->hw_pix_fmt) {
+    /* Decided from the frame, not d->hw_pix_fmt: the decoding thread may be
+     * reopening the codec while an older frame is shown here. */
+    if (frame->hw_frames_ctx) {
         d->sw_frame->format = AV_PIX_FMT_NV12;
         if (av_hwframe_transfer_data(d->sw_frame, frame, 0) < 0) {
             fprintf(stderr, "[dec] hwframe_transfer failed\n");

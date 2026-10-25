@@ -19,6 +19,7 @@
 #include "idle_watchdog.h"
 #include "timing_stats.h"
 #include "cursor_predictor.h"
+#include "decode_thread.h"
 #include "receiver_profile.h"
 #include "proto.h"
 #include "tb_gesture_bridge.h"
@@ -61,6 +62,7 @@
 struct app {
     struct tb_display *disp;
     struct tb_decoder *dec;
+    struct tb_decode_thread *decode_thread;
     struct tb_parser   parser;
 
     int      server_fd;
@@ -132,9 +134,14 @@ struct app {
     } last_cursor;
     /* Latency log, one window per second (see the [latency] line). */
     struct tb_timing_stats cursor_rtt_us;
+    /* Time between event-loop passes while streaming: the longest a mouse
+     * event or cursor packet can wait to be handled. */
+    struct tb_timing_stats loop_gap_us;
+    uint64_t last_loop_us;
+    /* Socket reads skipped because the decoder was behind (back-pressure). */
+    uint64_t throttled_reads;
     struct tb_timing_stats input_wait_us;
     struct tb_timing_stats predict_error_tenths_pt;
-    struct tb_timing_stats frame_decode_us;
     uint64_t last_latency_report_ms;
     uint64_t last_target_switch_ms;
     uint64_t last_space_switch_ms;
@@ -1225,19 +1232,16 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
         break;
     case TB_PKT_PARAM_SETS:
         a->session_active = 1;
-        /* tb_dec_set_param_sets is now a no-op if the sets are unchanged,
-         * so we don't spam a log line per keyframe. */
-        tb_dec_set_param_sets(a->dec, payload, len);
+        /* tb_dec_set_param_sets is a no-op if the sets are unchanged, so
+         * this does not log a line per keyframe. Ordered with the frames on
+         * the decode thread. */
+        tb_decode_thread_queue_params(a->decode_thread, payload, len);
         break;
     case TB_PKT_FRAME:
-        {
-            /* Decode only; the newest frame is shown once per socket read
-             * (tb_dec_present_latest). */
-            const uint64_t start = now_us();
-            a->session_active = 1;
-            tb_dec_feed_frame(a->dec, payload, len);
-            tb_timing_stats_add_elapsed(&a->frame_decode_us, start, now_us());
-        }
+        /* Decoded on the decode thread; the loop shows the newest result
+         * (tb_dec_present_latest) so decoding never blocks input. */
+        a->session_active = 1;
+        tb_decode_thread_queue_frame(a->decode_thread, payload, len);
         break;
     case TB_PKT_RAW_FRAME:
         /* Uncompressed frames point into the packet buffer, so they are shown
@@ -1386,11 +1390,20 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
 #define TB_DRAIN_BUDGET_US 16000
 
 static int drain_socket(struct app *a) {
-    uint8_t buf[1024 * 1024];
+    /* 256 KB reads keep the back-pressure check close to frame granularity
+     * (a 5K frame is roughly 100-500 KB). */
+    static uint8_t buf[256 * 1024];
     int saw_data = 0;
     const uint64_t started = now_us();
     for (;;) {
         if (saw_data && now_us() - started >= TB_DRAIN_BUDGET_US) return saw_data;
+        /* The decoder is behind: leave the rest in the socket so TCP slows
+         * the Sender (which then drops frames before encoding) instead of
+         * queueing video here. Reading resumes as soon as a frame is done. */
+        if (!tb_decode_thread_wants_frames(a->decode_thread)) {
+            a->throttled_reads++;
+            return saw_data;
+        }
         ssize_t n = read(a->client_fd, buf, sizeof(buf));
         if (n > 0) {
             saw_data = 1;
@@ -2060,7 +2073,7 @@ static void close_client(struct app *a) {
     a->last_clipboard_text[0] = '\0';
     tb_parser_free(&a->parser);
     tb_parser_init(&a->parser, on_packet, a);
-    tb_dec_reset(a->dec);   /* fresh decoder for next session */
+    tb_decode_thread_reset(a->decode_thread);   /* fresh decoder for next session */
     tb_audio_close_for_idle(a);
     fprintf(stderr, "[main] client disconnected\n");
 }
@@ -2204,6 +2217,8 @@ int main(int argc, char **argv) {
 
     a.dec = tb_dec_create(on_frame, &a);
     if (!a.dec) { fprintf(stderr, "tb_dec_create failed\n"); tb_disp_destroy(a.disp); return 1; }
+    a.decode_thread = tb_decode_thread_create(a.dec);
+    if (!a.decode_thread) { tb_dec_destroy(a.dec); tb_disp_destroy(a.disp); return 1; }
 
     tb_parser_init(&a.parser, on_packet, &a);
 
@@ -2214,6 +2229,13 @@ int main(int argc, char **argv) {
     a.last_ip_check_ms = 0;
 
     while (!g_term) {
+        {
+            const uint64_t loop_now = now_us();
+            if (a.client_fd >= 0 && a.have_video_frame) {
+                tb_timing_stats_add_elapsed(&a.loop_gap_us, a.last_loop_us, loop_now);
+            }
+            a.last_loop_us = loop_now;
+        }
         unsigned int disp_actions = tb_disp_poll_actions(a.disp);
         int socket_activity = 0;
         /* Service every ready run-loop source, not just one: the global input
@@ -2376,8 +2398,10 @@ int main(int argc, char **argv) {
                 close_client(&a);
             } else {
                 socket_activity = drain_result;
-                /* Show only the newest frame this drain decoded: when behind,
-                 * older ones are skipped rather than queued (5K 60 lag). */
+                /* Show the newest frame the decode thread finished, if any:
+                 * when it is behind, older ones are skipped rather than
+                 * queued (5K 60 lag). Runs every pass, not only after reads,
+                 * since decoding finishes asynchronously. */
                 tb_dec_present_latest(a.dec);
                 /* Show a cursor move now rather than with the next video
                  * frame, which only comes when the screen content changes. */
@@ -2450,9 +2474,11 @@ int main(int argc, char **argv) {
          *                       only; the layer shows immediately).
          *   [frames]  decoded/shown/skipped per second (skipped = replaced
          *             by a newer frame before it could be shown, i.e. the
-         *             receiver was behind), then decode, upload (NV12 →
-         *             texture) and present time per frame. Also logged
-         *             whenever frames were skipped. */
+         *             receiver was behind), throttled = socket reads put off
+         *             because the decoder was behind (the Sender is being
+         *             slowed), then decode, upload (NV12 → texture),
+         *             present time and the event-loop gap. Also logged
+         *             whenever frames were skipped or reads throttled. */
         if (t - a.last_latency_report_ms >= 1000) {
             a.last_latency_report_ms = t;
             struct tb_timing_summary rtt, wait, predict, decode, upload, present;
@@ -2463,20 +2489,33 @@ int main(int argc, char **argv) {
             const int have_rtt = tb_timing_stats_take_summary(&a.cursor_rtt_us, &rtt);
             const int have_wait = tb_timing_stats_take_summary(&a.input_wait_us, &wait);
             const int have_predict = tb_timing_stats_take_summary(&a.predict_error_tenths_pt, &predict);
-            const int have_decode = tb_timing_stats_take_summary(&a.frame_decode_us, &decode);
+            const int have_decode = tb_decode_thread_take_decode_stats(a.decode_thread, &decode);
             const int have_split = tb_disp_take_frame_stats(a.disp, &upload, &present);
-            if ((have_decode || have_split) && (have_rtt || have_wait || skipped > 0)) {
+            const uint64_t throttled = a.throttled_reads;
+            a.throttled_reads = 0;
+            if ((have_decode || have_split) && (have_rtt || have_wait || skipped > 0 || throttled > 0)) {
                 char decode_text[96] = "-", upload_text[96] = "-", present_text[96] = "-";
                 if (have_decode) tb_format_timing_ms(decode_text, sizeof(decode_text), &decode);
                 if (have_split) {
                     tb_format_timing_ms(upload_text, sizeof(upload_text), &upload);
                     tb_format_timing_ms(present_text, sizeof(present_text), &present);
                 }
-                tb_receiver_input_log("[frames] decoded=%llu shown=%llu skipped=%llu | decode %s | upload %s | present %s",
+                struct tb_timing_summary loop_gap;
+                char loop_text[96] = "-";
+                if (tb_timing_stats_take_summary(&a.loop_gap_us, &loop_gap)) {
+                    snprintf(loop_text, sizeof(loop_text), "p95=%.1fms max=%.1fms",
+                             loop_gap.p95 / 1000.0, loop_gap.max / 1000.0);
+                }
+                tb_receiver_input_log("[frames] decoded=%llu shown=%llu skipped=%llu throttled=%llu | decode %s | upload %s | present %s | loop gap %s",
                                       (unsigned long long)decoded,
                                       (unsigned long long)(have_split ? upload.count : 0),
                                       (unsigned long long)skipped,
-                                      decode_text, upload_text, present_text);
+                                      (unsigned long long)throttled,
+                                      decode_text, upload_text, present_text, loop_text);
+            } else {
+                /* Keep the loop-gap window to the same second as the rest. */
+                struct tb_timing_summary unused;
+                (void)tb_timing_stats_take_summary(&a.loop_gap_us, &unused);
             }
             if (have_rtt || have_wait) {
                 char rtt_text[96] = "-", wait_text[96] = "-", predict_text[96] = "off", draw_text[64] = "layer";
@@ -2509,6 +2548,7 @@ int main(int argc, char **argv) {
     if (a.server_fd >= 0) close(a.server_fd);
     bonjour_deinit(&a);
     tb_parser_free(&a.parser);
+    tb_decode_thread_destroy(a.decode_thread);   /* joins before the decoder goes */
     tb_dec_destroy(a.dec);
     tb_audio_close_for_idle(&a);
     tb_disp_destroy(a.disp);

@@ -34,7 +34,7 @@ ifeq ($(UNAME_S),Darwin)
 LDFLAGS  += -framework ApplicationServices -framework AppKit -framework CoreFoundation -framework CoreGraphics -framework CoreText -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface -framework CoreServices -framework CoreAudio -framework SystemConfiguration -framework QuartzCore
 endif
 
-C_SRC = src/main.c src/net.c src/decoder.c src/display.c src/input_queue.c src/idle_watchdog.c src/timing_stats.c src/cursor_predictor.c src/receiver_profile.c src/tb_i18n.c
+C_SRC = src/main.c src/net.c src/decoder.c src/display.c src/input_queue.c src/idle_watchdog.c src/timing_stats.c src/cursor_predictor.c src/decode_thread.c src/receiver_profile.c src/tb_i18n.c
 OBJC_SRC = src/tb_gesture_bridge.m src/tb_display_tweaks.m src/tb_cursor_layer.m
 OBJ = $(C_SRC:.c=.o) $(OBJC_SRC:.m=.o)
 BIN = tbreceiver
@@ -51,7 +51,7 @@ $(BIN): $(OBJ)
 	$(CC) $(CFLAGS) -fobjc-arc -c -o $@ $<
 
 clean:
-	rm -f $(OBJ) $(BIN) $(TEST_BIN) $(TEST_INPUT_QUEUE_BIN) $(TEST_IDLE_WATCHDOG_BIN) $(TEST_TIMING_STATS_BIN) $(TEST_CURSOR_PREDICTOR_BIN) $(TEST_RECEIVER_PROFILE_BIN) test_monitor_shield
+	rm -f $(OBJ) $(BIN) $(TEST_BIN) $(TEST_INPUT_QUEUE_BIN) $(TEST_IDLE_WATCHDOG_BIN) $(TEST_TIMING_STATS_BIN) $(TEST_CURSOR_PREDICTOR_BIN) $(TEST_DECODE_THREAD_BIN) $(TEST_RECEIVER_PROFILE_BIN) test_monitor_shield
 
 # Unit tests for the packet parser. net.c is pure POSIX, so this needs no
 # ffmpeg/SDL/pkgconf — it runs anywhere, including CI, with no hardware.
@@ -65,6 +65,7 @@ TEST_INPUT_QUEUE_BIN = test_input_queue
 TEST_IDLE_WATCHDOG_BIN = test_idle_watchdog
 TEST_TIMING_STATS_BIN = test_timing_stats
 TEST_CURSOR_PREDICTOR_BIN = test_cursor_predictor
+TEST_DECODE_THREAD_BIN = test_decode_thread
 TEST_RECEIVER_PROFILE_BIN = test_receiver_profile
 
 test_net_parser: tests/test_net_parser.c src/net.c src/net.h src/proto.h
@@ -82,15 +83,19 @@ $(TEST_TIMING_STATS_BIN): tests/test_timing_stats.c src/timing_stats.c src/timin
 $(TEST_CURSOR_PREDICTOR_BIN): tests/test_cursor_predictor.c src/cursor_predictor.c src/cursor_predictor.h
 	$(CC) $(TEST_CFLAGS) -Isrc tests/test_cursor_predictor.c src/cursor_predictor.c -lm -o $@
 
+$(TEST_DECODE_THREAD_BIN): tests/test_decode_thread.c src/decode_thread.c src/decode_thread.h src/timing_stats.c src/timing_stats.h
+	$(CC) $(TEST_CFLAGS) -Isrc tests/test_decode_thread.c src/decode_thread.c src/timing_stats.c -lpthread -o $@
+
 $(TEST_RECEIVER_PROFILE_BIN): tests/test_receiver_profile.c src/receiver_profile.c src/receiver_profile.h
 	$(CC) $(TEST_CFLAGS) -Isrc tests/test_receiver_profile.c src/receiver_profile.c -o $@
 
-test: $(TEST_BIN) $(TEST_INPUT_QUEUE_BIN) $(TEST_IDLE_WATCHDOG_BIN) $(TEST_TIMING_STATS_BIN) $(TEST_CURSOR_PREDICTOR_BIN) $(TEST_RECEIVER_PROFILE_BIN)
+test: $(TEST_BIN) $(TEST_INPUT_QUEUE_BIN) $(TEST_IDLE_WATCHDOG_BIN) $(TEST_TIMING_STATS_BIN) $(TEST_CURSOR_PREDICTOR_BIN) $(TEST_DECODE_THREAD_BIN) $(TEST_RECEIVER_PROFILE_BIN)
 	./$(TEST_BIN)
 	./$(TEST_INPUT_QUEUE_BIN)
 	./$(TEST_IDLE_WATCHDOG_BIN)
 	./$(TEST_TIMING_STATS_BIN)
 	./$(TEST_CURSOR_PREDICTOR_BIN)
+	./$(TEST_DECODE_THREAD_BIN)
 	./$(TEST_RECEIVER_PROFILE_BIN)
 
 # AppKit lifecycle coverage requires a logged-in macOS GUI session.
