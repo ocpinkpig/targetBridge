@@ -21,6 +21,7 @@ tbreceiver
 test_net_parser
 test_input_queue
 test_idle_watchdog
+test_cursor_latency
 test_receiver_profile
 test_monitor_shield
 *.dSYM/

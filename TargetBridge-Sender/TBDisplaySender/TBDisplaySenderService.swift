@@ -1392,6 +1392,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private var cursorDisplayID: CGDirectDisplayID = kCGNullDirectDisplay
     private var lastCursorPacket: TBMonitorCursor?
     private var injectedRemoteMouseLocation: CGPoint?
+    private var lastInjectedMoveUptime: TimeInterval = 0
     private var cachedLocalInputEventSource: CGEventSource?
     private var injectedLeftClickTracker = TBInjectedClickStateTracker()
     private let localPointerModifierBridge = TBLocalPointerModifierBridge()
@@ -2339,6 +2340,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         guard let current = injectedRemoteMouseLocation ?? currentLocalMouseLocation() else { return }
         let target = clampedMouseTarget(from: current, dx: dx, dy: dy)
         injectedRemoteMouseLocation = target
+        lastInjectedMoveUptime = ProcessInfo.processInfo.systemUptime
         let shouldWarp = (type == .mouseMoved)
         if shouldWarp {
             CGWarpMouseCursorPosition(target)
@@ -2492,12 +2494,16 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         switch event.kind {
         case "move":
             postLocalMouseMove(dx: event.dx ?? 0, dy: event.dy ?? 0)
+            sendInjectedCursorUpdate(echo: event.t)
         case "leftDrag":
             postLocalMouseMove(dx: event.dx ?? 0, dy: event.dy ?? 0, type: .leftMouseDragged, button: .left)
+            sendInjectedCursorUpdate(echo: event.t)
         case "rightDrag":
             postLocalMouseMove(dx: event.dx ?? 0, dy: event.dy ?? 0, type: .rightMouseDragged, button: .right)
+            sendInjectedCursorUpdate(echo: event.t)
         case "otherDrag":
             postLocalMouseMove(dx: event.dx ?? 0, dy: event.dy ?? 0, type: .otherMouseDragged, button: .center)
+            sendInjectedCursorUpdate(echo: event.t)
         case "leftDown":
             let buttonEvent = TBMonitorProtocol.decodeJSON(TBMonitorInputButtonEvent.self, from: payload)
             postLocalMouseButton(type: .leftMouseDown, button: .left, clickCount: buttonEvent?.clickCount)
@@ -3554,41 +3560,78 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         return type
     }
 
-    private func sendCursorUpdateIfNeeded(force: Bool = false) {
-        guard !inputRelayActive else { return }
-        guard isConnected, isStreaming, cursorDisplayID != kCGNullDirectDisplay else { return }
-        guard let point = CGEvent(source: nil)?.location else { return }
+    /// Overlay cursor in receiver control: send the position as soon as a
+    /// move is injected instead of waiting up to one 120 Hz timer tick.
+    private func sendInjectedCursorUpdate(echo: UInt64?) {
+        guard cursorTimer != nil, let target = injectedRemoteMouseLocation else { return }
+        sendCursorUpdateIfNeeded(location: target, echo: echo)
+    }
 
-        let bounds = CGDisplayBounds(cursorDisplayID)
-        guard bounds.width > 0, bounds.height > 0 else { return }
-
+    /// Maps a global cursor location onto the stream's pixel grid.
+    static func cursorPacket(
+        at point: CGPoint,
+        displayBounds bounds: CGRect,
+        streamWidth: Int,
+        streamHeight: Int,
+        type: Int,
+        large: Bool,
+        echo: UInt64? = nil
+    ) -> TBMonitorCursor? {
+        guard bounds.width > 0, bounds.height > 0 else { return nil }
         let localX = point.x - bounds.origin.x
         let localY = point.y - bounds.origin.y
         let visible = localX >= 0 && localY >= 0 && localX <= bounds.width && localY <= bounds.height
-
-        let scaledX = Int((max(0, min(bounds.width, localX)) / bounds.width) * Double(capturePreset.width))
-        let scaledY = Int((max(0, min(bounds.height, localY)) / bounds.height) * Double(capturePreset.height))
-        let cursor = TBMonitorCursor(
+        let scaledX = Int((max(0, min(bounds.width, localX)) / bounds.width) * Double(streamWidth))
+        let scaledY = Int((max(0, min(bounds.height, localY)) / bounds.height) * Double(streamHeight))
+        return TBMonitorCursor(
             x: scaledX,
             y: scaledY,
-            width: capturePreset.width,
-            height: capturePreset.height,
+            width: streamWidth,
+            height: streamHeight,
             visible: visible,
-            type: getCurrentCursorType(),
-            large: largeCursor
+            type: type,
+            large: large,
+            echo: echo
         )
+    }
 
-        if !force, let previous = lastCursorPacket {
-            let movement = abs(previous.x - cursor.x) + abs(previous.y - cursor.y)
-            if movement < 2,
-               previous.visible == cursor.visible,
-               previous.width == cursor.width,
-               previous.height == cursor.height,
-               previous.type == cursor.type,
-               previous.large == cursor.large {
-                return
-            }
-        }
+    /// Skips packets that would not visibly change the overlay. A packet that
+    /// answers a receiver move (echo set) always goes out, so latency samples
+    /// are not held back until the cursor has moved 2 px.
+    static func shouldSendCursorPacket(_ cursor: TBMonitorCursor, after previous: TBMonitorCursor?, force: Bool) -> Bool {
+        guard !force, cursor.echo == nil, let previous else { return true }
+        let movement = abs(previous.x - cursor.x) + abs(previous.y - cursor.y)
+        return movement >= 2 ||
+            previous.visible != cursor.visible ||
+            previous.width != cursor.width ||
+            previous.height != cursor.height ||
+            previous.type != cursor.type ||
+            previous.large != cursor.large
+    }
+
+    private func sendCursorUpdateIfNeeded(force: Bool = false, location: CGPoint? = nil, echo: UInt64? = nil) {
+        guard !inputRelayActive else { return }
+        guard isConnected, isStreaming, cursorDisplayID != kCGNullDirectDisplay else { return }
+        // Right after a receiver move, the injected location is where the
+        // cursor is going even if the posted event has not been processed yet;
+        // reading the live location could send an older point after a newer
+        // one. Later, follow the live cursor (the Sender's own mouse may move).
+        let recentlyInjected = inputControlRole == .receiverMaster &&
+            ProcessInfo.processInfo.systemUptime - lastInjectedMoveUptime < 0.1
+        let injectedLocation = recentlyInjected ? injectedRemoteMouseLocation : nil
+        guard let point = location ?? injectedLocation ?? CGEvent(source: nil)?.location else { return }
+
+        guard let cursor = Self.cursorPacket(
+            at: point,
+            displayBounds: CGDisplayBounds(cursorDisplayID),
+            streamWidth: capturePreset.width,
+            streamHeight: capturePreset.height,
+            type: getCurrentCursorType(),
+            large: largeCursor,
+            echo: echo
+        ) else { return }
+
+        guard Self.shouldSendCursorPacket(cursor, after: lastCursorPacket, force: force) else { return }
 
         lastCursorPacket = cursor
         if let packet = TBMonitorProtocol.makeJSONPacket(type: .cursor, value: cursor) {

@@ -56,6 +56,16 @@ void tb_disp_set_cursor(struct tb_display *d,
                         int type,
                         int large);
 
+/* Present a cursor change that no video frame has drawn yet. Call once per
+ * event-loop pass, after reading the socket. */
+void tb_disp_flush_cursor(struct tb_display *d);
+
+/* Read and reset how long cursor updates waited before being presented. */
+void tb_disp_take_cursor_draw_stats(struct tb_display *d,
+                                    uint64_t *count,
+                                    uint64_t *sum_us,
+                                    uint64_t *max_us);
+
 void tb_disp_set_brightness(struct tb_display *d, double level);
 
 /* Poll input actions while idle/connected. */

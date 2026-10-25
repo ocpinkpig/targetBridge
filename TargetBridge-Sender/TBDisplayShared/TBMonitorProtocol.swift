@@ -77,6 +77,9 @@ struct TBMonitorCursor: Codable {
     var visible: Bool
     var type: Int
     var large: Bool
+    /// The `t` of the receiver move this position answers, echoed unchanged so
+    /// the Receiver can time the round trip on its own clock. Omitted otherwise.
+    var echo: UInt64? = nil
 }
 
 struct TBMonitorInputEvent: Codable {
@@ -86,6 +89,8 @@ struct TBMonitorInputEvent: Codable {
     var scrollX: Int?
     var scrollY: Int?
     var keyCode: UInt16?
+    /// Receiver send time (its monotonic clock, µs) on move/drag events.
+    var t: UInt64? = nil
 }
 
 struct TBMonitorInputButtonEvent: Codable {

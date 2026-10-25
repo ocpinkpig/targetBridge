@@ -144,6 +144,52 @@ final class TBSenderAutomationParsingTests: XCTestCase {
         TBMonitorCursor(x: 10, y: 20, width: 1920, height: 1080, visible: visible, type: 0, large: false)
     }
 
+    func testCursorPacketMapsDisplayPointsOntoStreamPixels() throws {
+        // A 2560x1440-point display at x=1000 streamed at 5120x2880.
+        let bounds = CGRect(x: 1000, y: 0, width: 2560, height: 1440)
+        let middle = try XCTUnwrap(TBDisplaySenderSession.cursorPacket(
+            at: CGPoint(x: 2280, y: 720), displayBounds: bounds,
+            streamWidth: 5120, streamHeight: 2880, type: 0, large: false, echo: 42
+        ))
+        XCTAssertEqual(middle.x, 2560)
+        XCTAssertEqual(middle.y, 1440)
+        XCTAssertTrue(middle.visible)
+        XCTAssertEqual(middle.echo, 42)
+
+        // Off the display: hidden, pinned to the nearest edge.
+        let off = try XCTUnwrap(TBDisplaySenderSession.cursorPacket(
+            at: CGPoint(x: 500, y: 720), displayBounds: bounds,
+            streamWidth: 5120, streamHeight: 2880, type: 0, large: false
+        ))
+        XCTAssertFalse(off.visible)
+        XCTAssertEqual(off.x, 0)
+
+        XCTAssertNil(TBDisplaySenderSession.cursorPacket(
+            at: .zero, displayBounds: .zero, streamWidth: 5120, streamHeight: 2880, type: 0, large: false
+        ))
+    }
+
+    func testCursorPacketDedupeNeverHoldsBackAnAnsweredMove() {
+        let previous = cursorPacket(visible: true)
+        var tiny = previous
+        tiny.x += 1  // under the 2 px threshold
+        XCTAssertFalse(TBDisplaySenderSession.shouldSendCursorPacket(tiny, after: previous, force: false))
+        XCTAssertTrue(TBDisplaySenderSession.shouldSendCursorPacket(tiny, after: previous, force: true))
+
+        // Answering a receiver move: always sent, so latency samples are not
+        // delayed until the cursor has moved 2 px.
+        tiny.echo = 7
+        XCTAssertTrue(TBDisplaySenderSession.shouldSendCursorPacket(tiny, after: previous, force: false))
+
+        var moved = previous
+        moved.x += 2
+        XCTAssertTrue(TBDisplaySenderSession.shouldSendCursorPacket(moved, after: previous, force: false))
+        var shape = previous
+        shape.type = 1
+        XCTAssertTrue(TBDisplaySenderSession.shouldSendCursorPacket(shape, after: previous, force: false))
+        XCTAssertTrue(TBDisplaySenderSession.shouldSendCursorPacket(previous, after: nil, force: false))
+    }
+
     func testLeavingOverlayModeHidesTheReceiverOverlayCursor() {
         // The Receiver keeps drawing the last overlay cursor until told
         // visible=false; without it a frozen arrow sits beside the video cursor.

@@ -50,7 +50,14 @@ struct tb_display {
     int           cursor_visible;
     int           cursor_type;
     int           cursor_large;
-    uint32_t      last_video_frame_time;
+    /* Cursor moved since the last present; drawn by tb_disp_flush_cursor. */
+    int           cursor_dirty;
+    uint64_t      cursor_dirty_since_us;
+    uint64_t      last_present_us;
+    /* How long cursor updates waited to be presented, for latency logs. */
+    uint64_t      cursor_draw_count;
+    uint64_t      cursor_draw_sum_us;
+    uint64_t      cursor_draw_max_us;
     int           system_cursor_hidden;
 
     char          last_ip[64];
@@ -616,7 +623,6 @@ struct tb_display *tb_disp_create(int fullscreen) {
     d->cursor_visible = 0;
     d->cursor_type = 0;
     d->system_cursor_hidden = 0;
-    d->last_video_frame_time = 0;
 
     tb_disp_refresh_window_mode(d);
     SDL_ShowWindow(d->win);
@@ -1114,12 +1120,28 @@ static void tb_disp_draw_cursor(struct tb_display *d) {
     SDL_SetRenderDrawBlendMode(d->ren, old_blend);
 }
 
+static uint64_t tb_disp_now_us(void) {
+    static uint64_t freq = 0;
+    if (!freq) freq = SDL_GetPerformanceFrequency();
+    return (uint64_t)((double)SDL_GetPerformanceCounter() * 1000000.0 / (double)freq);
+}
+
 static void tb_disp_render_current(struct tb_display *d) {
     if (!d || !d->tex) return;
     SDL_RenderClear(d->ren);
     SDL_RenderCopy(d->ren, d->tex, NULL, NULL);
     tb_disp_draw_cursor(d);
     SDL_RenderPresent(d->ren);
+
+    uint64_t now = tb_disp_now_us();
+    d->last_present_us = now;
+    if (d->cursor_dirty) {
+        uint64_t waited = now - d->cursor_dirty_since_us;
+        d->cursor_draw_count += 1;
+        d->cursor_draw_sum_us += waited;
+        if (waited > d->cursor_draw_max_us) d->cursor_draw_max_us = waited;
+        d->cursor_dirty = 0;
+    }
 }
 
 void tb_disp_render_nv12(struct tb_display *d,
@@ -1135,7 +1157,6 @@ void tb_disp_render_nv12(struct tb_display *d,
         fprintf(stderr, "[disp] UpdateNVTexture: %s\n", SDL_GetError());
         return;
     }
-    d->last_video_frame_time = SDL_GetTicks();
     tb_disp_render_current(d);
 }
 
@@ -1154,12 +1175,37 @@ void tb_disp_set_cursor(struct tb_display *d,
     d->cursor_type = type;
     d->cursor_large = large;
 
-    uint32_t now = SDL_GetTicks();
-    if (now - d->last_video_frame_time > 40) {
-        if (d->is_connected && d->tex) {
-            tb_disp_render_current(d);
-        }
+    /* Draw on the next tb_disp_flush_cursor() (or video frame, whichever
+     * comes first) instead of here, so a burst of packets read in one socket
+     * drain costs one present. */
+    if (!d->cursor_dirty) {
+        d->cursor_dirty = 1;
+        d->cursor_dirty_since_us = tb_disp_now_us();
     }
+}
+
+/* Minimum gap between cursor-only presents: caps a fast mouse at ~500 Hz of
+ * full-frame redraws while adding at most 2 ms. */
+#define TB_DISP_CURSOR_MIN_PRESENT_US 2000
+
+void tb_disp_flush_cursor(struct tb_display *d) {
+    if (!d || !d->cursor_dirty) return;
+    if (!d->is_connected || !d->tex) return;
+    if (tb_disp_now_us() - d->last_present_us < TB_DISP_CURSOR_MIN_PRESENT_US) return;
+    tb_disp_render_current(d);
+}
+
+void tb_disp_take_cursor_draw_stats(struct tb_display *d,
+                                    uint64_t *count,
+                                    uint64_t *sum_us,
+                                    uint64_t *max_us) {
+    if (!d) return;
+    if (count) *count = d->cursor_draw_count;
+    if (sum_us) *sum_us = d->cursor_draw_sum_us;
+    if (max_us) *max_us = d->cursor_draw_max_us;
+    d->cursor_draw_count = 0;
+    d->cursor_draw_sum_us = 0;
+    d->cursor_draw_max_us = 0;
 }
 
 unsigned int tb_disp_poll_actions(struct tb_display *d) {

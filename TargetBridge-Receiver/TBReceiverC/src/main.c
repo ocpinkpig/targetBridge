@@ -17,6 +17,7 @@
 #include "decoder.h"
 #include "display.h"
 #include "idle_watchdog.h"
+#include "cursor_latency.h"
 #include "receiver_profile.h"
 #include "proto.h"
 #include "tb_gesture_bridge.h"
@@ -119,6 +120,8 @@ struct app {
 
     uint64_t input_events_sent;
     uint64_t input_events_received;
+    struct tb_cursor_latency cursor_latency;
+    uint64_t last_latency_report_ms;
     uint64_t last_target_switch_ms;
     uint64_t last_space_switch_ms;
     uint64_t last_space_gesture_ms;
@@ -175,6 +178,12 @@ static uint64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
+}
+
+static uint64_t now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000ULL;
 }
 
 static void tb_copy_i18n(char *dest, size_t size, const char *key);
@@ -1218,6 +1227,10 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
             (void)extract_json_bool_field(payload, len, "\"visible\"", &visible);
             (void)extract_json_int_field(payload, len, "\"type\"", &type);
             (void)extract_json_bool_field(payload, len, "\"large\"", &large);
+            double echo = 0;
+            if (extract_json_double_field(payload, len, "\"echo\"", &echo) && echo > 0) {
+                tb_cursor_latency_record(&a->cursor_latency, (uint64_t)echo, now_us());
+            }
             tb_disp_set_cursor(a->disp, x, y, w, h, visible, type, large);
         }
         break;
@@ -1386,6 +1399,11 @@ static void tb_receiver_send_input_event(struct app *a,
     if (has_scroll_x) len += snprintf(json + len, sizeof(json) - (size_t)len, ",\"scrollX\":%d", scroll_x);
     if (has_scroll_y) len += snprintf(json + len, sizeof(json) - (size_t)len, ",\"scrollY\":%d", scroll_y);
     if (has_key_code) len += snprintf(json + len, sizeof(json) - (size_t)len, ",\"keyCode\":%u", (unsigned int)key_code);
+    /* Moves and drags carry a send stamp the Sender echoes in its next cursor
+     * packet, so the round trip can be timed on this Mac's clock alone. */
+    if (has_dx && has_dy) {
+        len += snprintf(json + len, sizeof(json) - (size_t)len, ",\"t\":%llu", (unsigned long long)now_us());
+    }
     len += snprintf(json + len, sizeof(json) - (size_t)len, "}");
     if (len <= 0 || (size_t)len >= sizeof(json)) return;
 
@@ -2156,6 +2174,9 @@ int main(int argc, char **argv) {
                 close_client(&a);
             } else {
                 socket_activity = drain_result;
+                /* Show a cursor move now rather than with the next video
+                 * frame, which only comes when the screen content changes. */
+                tb_disp_flush_cursor(a.disp);
                 if (drain_result > 0) a.last_recv_ms = now_ms();
                 if (a.close_requested) {
                     close_client(&a);
@@ -2282,6 +2303,25 @@ int main(int argc, char **argv) {
             a.last_fps_count   = a.frames;
             a.last_fps_tick_ms = t;
             if (df > 0) fprintf(stderr, "[main] %llu fps\n", (unsigned long long)df);
+        }
+
+        /* Cursor latency, once a second while the mouse is moving:
+         * rtt = move sent → Sender's answering cursor packet received;
+         * draw = cursor packet received → presented on screen. */
+        if (t - a.last_latency_report_ms >= 1000) {
+            a.last_latency_report_ms = t;
+            struct tb_cursor_latency_summary rtt;
+            uint64_t draws = 0, draw_sum_us = 0, draw_max_us = 0;
+            tb_disp_take_cursor_draw_stats(a.disp, &draws, &draw_sum_us, &draw_max_us);
+            if (tb_cursor_latency_take_summary(&a.cursor_latency, &rtt)) {
+                tb_receiver_input_log("[latency] cursor rtt n=%llu avg=%.1fms p50=%.1fms p95=%.1fms max=%.1fms | draw n=%llu avg=%.1fms max=%.1fms",
+                                      (unsigned long long)rtt.count,
+                                      rtt.avg_us / 1000.0, rtt.p50_us / 1000.0,
+                                      rtt.p95_us / 1000.0, rtt.max_us / 1000.0,
+                                      (unsigned long long)draws,
+                                      draws ? (double)draw_sum_us / (double)draws / 1000.0 : 0.0,
+                                      draw_max_us / 1000.0);
+            }
         }
 
         /* Yield when idle or when a nonblocking active socket had no data,
