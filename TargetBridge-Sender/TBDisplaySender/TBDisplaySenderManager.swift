@@ -72,6 +72,20 @@ final class TBDisplaySenderService: ObservableObject {
             objectWillChange.send()
         }
     }
+    /// Default on: without it a receiverMaster cursor rides the video stream
+    /// and trails the Receiver's mouse by the full encode/decode latency.
+    @Published var lowLatencyCursor: Bool = {
+        if UserDefaults.standard.object(forKey: "fd.tbdisplaysender.lowLatencyCursor") == nil {
+            return true
+        }
+        return UserDefaults.standard.bool(forKey: "fd.tbdisplaysender.lowLatencyCursor")
+    }() {
+        didSet {
+            UserDefaults.standard.set(lowLatencyCursor, forKey: "fd.tbdisplaysender.lowLatencyCursor")
+            sessions.forEach { $0.lowLatencyCursor = lowLatencyCursor }
+            objectWillChange.send()
+        }
+    }
     @Published var preventDisplaySleep: Bool = {
         if UserDefaults.standard.object(forKey: "fd.tbdisplaysender.preventDisplaySleep") == nil {
             return true
@@ -288,6 +302,7 @@ final class TBDisplaySenderService: ObservableObject {
         let session = TBDisplaySenderSession(
             language: language,
             largeCursor: largeCursor,
+            lowLatencyCursor: lowLatencyCursor,
             preventDisplaySleep: preventDisplaySleep,
             autoRestartOnWake: autoRestartOnWake,
             audioEnabled: audioEnabled,
@@ -452,6 +467,7 @@ final class TBDisplaySenderService: ObservableObject {
             let session = TBDisplaySenderSession(
                 language: language,
                 largeCursor: largeCursor,
+                lowLatencyCursor: lowLatencyCursor,
                 preventDisplaySleep: preventDisplaySleep,
                 autoRestartOnWake: autoRestartOnWake,
                 audioEnabled: audioEnabled,

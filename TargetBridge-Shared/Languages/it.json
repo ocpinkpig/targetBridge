@@ -59,6 +59,8 @@
   "sender.mode_line_5": "Scegli la sorgente, poi bilancia fluidità e nitidezza col profilo stream.",
   "sender.toggle.show_menu_bar_icon": "Mostra icona nella top bar",
   "sender.toggle.large_cursor": "Cursore ingrandito sul receiver",
+  "sender.toggle.low_latency_cursor": "Cursore a bassa latenza quando il receiver controlla questo Mac",
+  "sender.toggle.low_latency_cursor_help": "Il receiver disegna il cursore da solo, così segue il suo mouse senza il ritardo del video. Alcune forme speciali del cursore appaiono come freccia.",
   "sender.toggle.prevent_display_sleep": "Impedisci screensaver e sospensione display durante lo streaming",
   "sender.toggle.auto_restart_on_wake": "Riavvia automaticamente la cattura al risveglio o sblocco",
   "sender.toggle.stream_audio": "Trasmetti audio",

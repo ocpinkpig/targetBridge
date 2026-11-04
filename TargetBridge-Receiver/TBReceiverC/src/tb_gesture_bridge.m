@@ -4,7 +4,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #include <stdio.h>
 
-static NSWindow *tb_receiver_content_window(void) {
+NSWindow *tb_receiver_content_window(void) {
     NSWindow *content = nil;
     CGFloat best_area = 0.0;
     for (NSWindow *window in NSApp.windows) {

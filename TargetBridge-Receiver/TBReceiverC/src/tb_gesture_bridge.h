@@ -20,4 +20,11 @@ void tb_receiver_set_monitor_shield(int active);
  * window. This avoids treating a windowed SDL drawable as the panel size. */
 int tb_receiver_content_display_pixels(uint32_t *width, uint32_t *height);
 
+#ifdef __OBJC__
+@class NSWindow;
+/* The receiver's SDL content window: the largest visible window. Found via
+ * NSApp rather than SDL_GetWindowWMInfo, which fails on the Intel build. */
+NSWindow *tb_receiver_content_window(void);
+#endif
+
 #endif

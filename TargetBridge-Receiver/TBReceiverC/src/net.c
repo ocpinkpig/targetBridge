@@ -126,7 +126,12 @@ int tb_net_accept(int server_fd) {
     if (c < 0) return -1;
     int fl = fcntl(c, F_GETFL, 0);
     fcntl(c, F_SETFL, fl | O_NONBLOCK);
-    int rcvbuf = 4 * 1024 * 1024;
+    /* Everything in this buffer is video the user has not seen yet. 4 MB held
+     * hundreds of ms of 5K video once the receiver fell behind; 1 MB still
+     * covers a 5K keyframe and the link's in-flight data, and makes a slow
+     * receiver push back on the Sender, which then drops frames before
+     * encoding instead of queueing them. */
+    int rcvbuf = 1024 * 1024;
     setsockopt(c, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
     /* disable Nagle for low latency */
     int yes = 1;

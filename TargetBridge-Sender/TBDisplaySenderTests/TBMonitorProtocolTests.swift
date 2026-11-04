@@ -228,6 +228,43 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertEqual(TBMonitorProtocol.decodeJSON(TBMonitorCursor.self, from: payload)?.large, false)
     }
 
+    func testCursorEchoIsOmittedUnlessSetAndSurvivesFullRange() throws {
+        // Old receivers parse cursor JSON by key; an absent echo must not be
+        // written as null. A µs monotonic stamp needs more than 32 bits.
+        var cursor = TBMonitorCursor(x: 1, y: 2, width: 2560, height: 1440, visible: true, type: 0, large: false)
+        let plain = try XCTUnwrap(String(data: JSONEncoder().encode(cursor), encoding: .utf8))
+        XCTAssertFalse(plain.contains("echo"))
+        XCTAssertFalse(plain.contains("point"))
+
+        cursor.echo = 987_654_321_012
+        let echoed = try JSONEncoder().encode(cursor)
+        XCTAssertTrue(try XCTUnwrap(String(data: echoed, encoding: .utf8)).contains("\"echo\":987654321012"))
+        XCTAssertEqual(TBMonitorProtocol.decodeJSON(TBMonitorCursor.self, from: echoed)?.echo, 987_654_321_012)
+    }
+
+    func testCursorPointSizeUsesKeysTheReceiverParses() throws {
+        // The Receiver looks fields up by exact key; "pointWidth" must not
+        // collide with its "width" lookup (it searches for "\"width\"").
+        let cursor = TBMonitorCursor(x: 1, y: 2, width: 5120, height: 2880, visible: true, type: 0,
+                                     large: false, pointWidth: 2560, pointHeight: 1440)
+        let json = try XCTUnwrap(String(data: JSONEncoder().encode(cursor), encoding: .utf8))
+        XCTAssertTrue(json.contains("\"pointWidth\":2560"))
+        XCTAssertTrue(json.contains("\"pointHeight\":1440"))
+        XCTAssertTrue(json.contains("\"width\":5120"))
+    }
+
+    func testReceiverMoveStampDecodes() {
+        // Exact shape tb_receiver_send_input_event writes for a move.
+        let payload = Data(#"{"kind":"move","dx":3,"dy":-2,"t":123456789012}"#.utf8)
+        let event = TBMonitorProtocol.decodeJSON(TBMonitorInputEvent.self, from: payload)
+        XCTAssertEqual(event?.kind, "move")
+        XCTAssertEqual(event?.dx, 3)
+        XCTAssertEqual(event?.t, 123_456_789_012)
+        // Older receivers send no stamp.
+        let unstamped = Data(#"{"kind":"move","dx":3,"dy":-2}"#.utf8)
+        XCTAssertNil(TBMonitorProtocol.decodeJSON(TBMonitorInputEvent.self, from: unstamped)?.t)
+    }
+
     func testInputButtonEventRoundTripPreservesClickCount() throws {
         let buttonEvent = TBMonitorInputButtonEvent(kind: "leftDown", clickCount: 2)
         guard var buffer = TBMonitorProtocol.makeJSONPacket(type: .inputEvent, value: buttonEvent),

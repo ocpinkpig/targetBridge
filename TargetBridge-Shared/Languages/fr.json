@@ -59,6 +59,8 @@
   "sender.mode_line_5": "Choisissez la source, puis équilibrez fluidité et clarté avec le profil de flux.",
   "sender.toggle.show_menu_bar_icon": "Afficher l’icône dans la barre des menus",
   "sender.toggle.large_cursor": "Grand curseur sur le receiver",
+  "sender.toggle.low_latency_cursor": "Curseur à faible latence quand le receiver contrôle ce Mac",
+  "sender.toggle.low_latency_cursor_help": "Le receiver dessine lui-même le curseur, qui suit sa souris sans le délai de la vidéo. Certaines formes spéciales de curseur s’affichent comme une flèche.",
   "sender.toggle.prevent_display_sleep": "Empêcher l’économiseur d’écran / la veille de l’écran pendant le flux",
   "sender.toggle.auto_restart_on_wake": "Redémarrer automatiquement la capture après la sortie de veille / le déverrouillage",
   "sender.toggle.stream_audio": "Diffuser l’audio",

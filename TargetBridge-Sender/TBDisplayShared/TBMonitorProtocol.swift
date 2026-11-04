@@ -77,6 +77,14 @@ struct TBMonitorCursor: Codable {
     var visible: Bool
     var type: Int
     var large: Bool
+    /// The `t` of the receiver move this position answers, echoed unchanged so
+    /// the Receiver can time the round trip on its own clock. Omitted otherwise.
+    var echo: UInt64? = nil
+    /// Size of the captured display in points: the unit of the Receiver's
+    /// move deltas, so it can predict where a move lands on the stream's
+    /// pixel grid. Omitted on hidden-cursor packets.
+    var pointWidth: Double? = nil
+    var pointHeight: Double? = nil
 }
 
 struct TBMonitorInputEvent: Codable {
@@ -86,6 +94,8 @@ struct TBMonitorInputEvent: Codable {
     var scrollX: Int?
     var scrollY: Int?
     var keyCode: UInt16?
+    /// Receiver send time (its monotonic clock, µs) on move/drag events.
+    var t: UInt64? = nil
 }
 
 struct TBMonitorInputButtonEvent: Codable {

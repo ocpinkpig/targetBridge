@@ -432,19 +432,33 @@ enum TBInputControlRole: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    func usesLowLatencyCursorOverlay(largeCursorEnabled: Bool) -> Bool {
-        // ScreenCaptureKit preserves every native macOS cursor shape, including
-        // temporary system cursors such as the screenshot crosshair. The custom
-        // overlay is reserved for the explicit large-cursor accessibility option.
-        largeCursorEnabled
+    /// Whether the Receiver draws the cursor itself from 120 Hz position
+    /// packets instead of seeing it inside the video.
+    ///
+    /// The video cursor keeps every native macOS shape (e.g. the screenshot
+    /// crosshair) but arrives only after capture → encode → network → decode,
+    /// which on a 5K stream is long enough that a cursor driven from the
+    /// Receiver's own mouse visibly trails the hand. So receiverMaster uses
+    /// the overlay unless the user opts out; the large cursor always does.
+    func usesLowLatencyCursorOverlay(
+        largeCursorEnabled: Bool,
+        lowLatencyCursorEnabled: Bool
+    ) -> Bool {
+        largeCursorEnabled || (self == .receiverMaster && lowLatencyCursorEnabled)
     }
 
     func changesCursorCaptureMode(
         from previousRole: TBInputControlRole,
-        largeCursorEnabled: Bool
+        largeCursorEnabled: Bool,
+        lowLatencyCursorEnabled: Bool
     ) -> Bool {
-        usesLowLatencyCursorOverlay(largeCursorEnabled: largeCursorEnabled)
-            != previousRole.usesLowLatencyCursorOverlay(largeCursorEnabled: largeCursorEnabled)
+        usesLowLatencyCursorOverlay(
+            largeCursorEnabled: largeCursorEnabled,
+            lowLatencyCursorEnabled: lowLatencyCursorEnabled
+        ) != previousRole.usesLowLatencyCursorOverlay(
+            largeCursorEnabled: largeCursorEnabled,
+            lowLatencyCursorEnabled: lowLatencyCursorEnabled
+        )
     }
 }
 
@@ -1102,6 +1116,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     init(
         language: TBDisplaySenderLanguage,
         largeCursor: Bool,
+        lowLatencyCursor: Bool = true,
         preventDisplaySleep: Bool,
         autoRestartOnWake: Bool,
         audioEnabled: Bool,
@@ -1114,6 +1129,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         self.displayStateText = TBDisplaySenderL10n.displayStateNotAvailable(language)
         self.language = language
         self.largeCursor = largeCursor
+        self.lowLatencyCursor = lowLatencyCursor
         self.preventDisplaySleep = preventDisplaySleep
         self.autoRestartOnWake = autoRestartOnWake
         self.audioEnabled = audioEnabled
@@ -1243,6 +1259,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
     }
     @Published var largeCursor: Bool
+    @Published var lowLatencyCursor: Bool
     @Published var preventDisplaySleep: Bool = true
     @Published var autoRestartOnWake: Bool = true
     @Published var verboseDisplayLogging: Bool = false {
@@ -1295,7 +1312,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         didSet {
             let cursorCaptureModeChanged = inputControlRole.changesCursorCaptureMode(
                 from: oldValue,
-                largeCursorEnabled: largeCursor
+                largeCursorEnabled: largeCursor,
+                lowLatencyCursorEnabled: lowLatencyCursor
             )
             inputRelayActive = (inputControlRole == .senderMaster)
             if inputControlRole != .receiverMaster {
@@ -1305,8 +1323,26 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 remoteHeldModifierKeyCodes.removeAll()
                 suppressedTriggerKeyCode = nil
             }
-            if cursorCaptureModeChanged, isStreaming {
-                restartCaptureNow()
+            if cursorCaptureModeChanged {
+                if !inputControlRole.usesLowLatencyCursorOverlay(
+                    largeCursorEnabled: largeCursor,
+                    lowLatencyCursorEnabled: lowLatencyCursor
+                ) {
+                    // Clear the overlay now rather than after the restart, so
+                    // the Receiver never shows it beside the video cursor.
+                    stopReceiverCursorOverlay()
+                }
+                switch Self.cursorModeRestartAction(
+                    isStreaming: isStreaming,
+                    isRestartingCapture: isRestartingCaptureAfterWake
+                ) {
+                case .restartNow:
+                    restartCaptureNow()
+                case .afterCurrentRestart:
+                    cursorModeRestartPending = true
+                case .none:
+                    break
+                }
             }
         }
     }
@@ -1356,6 +1392,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private var cursorDisplayID: CGDirectDisplayID = kCGNullDirectDisplay
     private var lastCursorPacket: TBMonitorCursor?
     private var injectedRemoteMouseLocation: CGPoint?
+    private var lastInjectedMoveUptime: TimeInterval = 0
     private var cachedLocalInputEventSource: CGEventSource?
     private var injectedLeftClickTracker = TBInjectedClickStateTracker()
     private let localPointerModifierBridge = TBLocalPointerModifierBridge()
@@ -1376,6 +1413,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     var onRemoteDeactivateInputRequest: (() -> Void)?
     nonisolated(unsafe) private var wakeObservers: [NSObjectProtocol] = []
     private var isRestartingCaptureAfterWake = false
+    /// A role change flipped the cursor capture mode while another restart
+    /// was running; restart once more when it finishes.
+    private var cursorModeRestartPending = false
     private var captureRestartGeneration: UInt64 = 0
     private var lastLoggedCaptureHealthState: TBCaptureHealth.State?
     nonisolated(unsafe) private var displayReconfigurationCallbackRegistered = false
@@ -1854,6 +1894,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         let connectionToClose = connection
         captureRestartGeneration &+= 1
         isRestartingCaptureAfterWake = false
+        cursorModeRestartPending = false
         if persistArrangement {
             persistExtendedDisplayArrangementIfNeeded()
         }
@@ -2312,6 +2353,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         guard let current = injectedRemoteMouseLocation ?? currentLocalMouseLocation() else { return }
         let target = clampedMouseTarget(from: current, dx: dx, dy: dy)
         injectedRemoteMouseLocation = target
+        lastInjectedMoveUptime = ProcessInfo.processInfo.systemUptime
         let shouldWarp = (type == .mouseMoved)
         if shouldWarp {
             CGWarpMouseCursorPosition(target)
@@ -2465,12 +2507,16 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         switch event.kind {
         case "move":
             postLocalMouseMove(dx: event.dx ?? 0, dy: event.dy ?? 0)
+            sendInjectedCursorUpdate(echo: event.t)
         case "leftDrag":
             postLocalMouseMove(dx: event.dx ?? 0, dy: event.dy ?? 0, type: .leftMouseDragged, button: .left)
+            sendInjectedCursorUpdate(echo: event.t)
         case "rightDrag":
             postLocalMouseMove(dx: event.dx ?? 0, dy: event.dy ?? 0, type: .rightMouseDragged, button: .right)
+            sendInjectedCursorUpdate(echo: event.t)
         case "otherDrag":
             postLocalMouseMove(dx: event.dx ?? 0, dy: event.dy ?? 0, type: .otherMouseDragged, button: .center)
+            sendInjectedCursorUpdate(echo: event.t)
         case "leftDown":
             let buttonEvent = TBMonitorProtocol.decodeJSON(TBMonitorInputButtonEvent.self, from: payload)
             postLocalMouseButton(type: .leftMouseDown, button: .left, clickCount: buttonEvent?.clickCount)
@@ -2828,7 +2874,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             }
 
             let usesCursorOverlay = inputControlRole.usesLowLatencyCursorOverlay(
-                largeCursorEnabled: largeCursor
+                largeCursorEnabled: largeCursor,
+                lowLatencyCursorEnabled: lowLatencyCursor
             )
             let configuration = SCStreamConfiguration()
             configuration.width = preset.width
@@ -2892,7 +2939,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             try await stream.startCapture()
             scStream = stream
             isStreaming = true
-            if usesCursorOverlay { startCursorUpdates(displayID: display.displayID) }
+            if usesCursorOverlay {
+                startCursorUpdates(displayID: display.displayID)
+            } else {
+                stopReceiverCursorOverlay()
+            }
             beginCaptureActivity(wakeDisplay: false)
             startFPSTimer()
             startCaptureWatchdog()
@@ -2943,7 +2994,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private func startDirectDisplayStream(displayID: CGDirectDisplayID, preset: TBDisplayCapturePreset) async -> Bool {
         guard let pipeline else { return false }
         let usesCursorOverlay = inputControlRole.usesLowLatencyCursorOverlay(
-            largeCursorEnabled: largeCursor
+            largeCursorEnabled: largeCursor,
+            lowLatencyCursorEnabled: lowLatencyCursor
         )
         let codecName = activeCodecName ?? codecName(for: activeCodecType ?? preset.codecType)
         streamResolutionText = TBDisplaySenderL10n.streamSummary(
@@ -2964,7 +3016,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         await startAuxiliaryAudioCapture(preferredDisplayID: displayID)
         captureDisplayText = TBDisplaySenderL10n.captureDisplayCGDisplayStream(language, id: displayID)
         isStreaming = true
-        if usesCursorOverlay { startCursorUpdates(displayID: displayID) }
+        if usesCursorOverlay {
+            startCursorUpdates(displayID: displayID)
+        } else {
+            stopReceiverCursorOverlay()
+        }
         beginCaptureActivity(wakeDisplay: false)
         startFPSTimer()
         startCaptureWatchdog()
@@ -3182,6 +3238,33 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
 
         return false
+    }
+
+    enum CursorModeRestartAction: Equatable {
+        case none
+        case restartNow
+        /// A restart is already running and may have read the old role.
+        case afterCurrentRestart
+    }
+
+    /// What to do when a role change flips whether the video carries the
+    /// cursor. A restart that is already running reads the role before it
+    /// starts the stream, so a change that lands later must not be dropped.
+    static func cursorModeRestartAction(
+        isStreaming: Bool,
+        isRestartingCapture: Bool
+    ) -> CursorModeRestartAction {
+        if isRestartingCapture { return .afterCurrentRestart }
+        return isStreaming ? .restartNow : .none
+    }
+
+    /// The Receiver keeps drawing the last overlay cursor it was sent until it
+    /// gets `visible: false`, so leaving overlay mode has to say so.
+    static func shouldHideReceiverCursorOverlay(
+        usesCursorOverlay: Bool,
+        lastCursorPacket: TBMonitorCursor?
+    ) -> Bool {
+        !usesCursorOverlay && lastCursorPacket?.visible == true
     }
 
     static func shouldUseHeadlessVirtualDisplay(
@@ -3420,6 +3503,19 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
     }
 
+    /// Stops overlay updates and hides any overlay cursor the Receiver is
+    /// still drawing, for a capture mode where the video carries the cursor.
+    private func stopReceiverCursorOverlay() {
+        cursorTimer?.invalidate()
+        cursorTimer = nil
+        if Self.shouldHideReceiverCursorOverlay(
+            usesCursorOverlay: false,
+            lastCursorPacket: lastCursorPacket
+        ) {
+            sendHiddenCursorPacketIfNeeded()
+        }
+    }
+
     private func applyCursorOverlayMode() {
         if inputRelayActive {
             cursorTimer?.invalidate()
@@ -3429,7 +3525,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
 
         let usesCursorOverlay = inputControlRole.usesLowLatencyCursorOverlay(
-            largeCursorEnabled: largeCursor
+            largeCursorEnabled: largeCursor,
+            lowLatencyCursorEnabled: lowLatencyCursor
         )
         guard usesCursorOverlay, isStreaming, cursorDisplayID != kCGNullDirectDisplay else { return }
         startCursorUpdates(displayID: cursorDisplayID)
@@ -3476,41 +3573,80 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         return type
     }
 
-    private func sendCursorUpdateIfNeeded(force: Bool = false) {
-        guard !inputRelayActive else { return }
-        guard isConnected, isStreaming, cursorDisplayID != kCGNullDirectDisplay else { return }
-        guard let point = CGEvent(source: nil)?.location else { return }
+    /// Overlay cursor in receiver control: send the position as soon as a
+    /// move is injected instead of waiting up to one 120 Hz timer tick.
+    private func sendInjectedCursorUpdate(echo: UInt64?) {
+        guard cursorTimer != nil, let target = injectedRemoteMouseLocation else { return }
+        sendCursorUpdateIfNeeded(location: target, echo: echo)
+    }
 
-        let bounds = CGDisplayBounds(cursorDisplayID)
-        guard bounds.width > 0, bounds.height > 0 else { return }
-
+    /// Maps a global cursor location onto the stream's pixel grid.
+    static func cursorPacket(
+        at point: CGPoint,
+        displayBounds bounds: CGRect,
+        streamWidth: Int,
+        streamHeight: Int,
+        type: Int,
+        large: Bool,
+        echo: UInt64? = nil
+    ) -> TBMonitorCursor? {
+        guard bounds.width > 0, bounds.height > 0 else { return nil }
         let localX = point.x - bounds.origin.x
         let localY = point.y - bounds.origin.y
         let visible = localX >= 0 && localY >= 0 && localX <= bounds.width && localY <= bounds.height
-
-        let scaledX = Int((max(0, min(bounds.width, localX)) / bounds.width) * Double(capturePreset.width))
-        let scaledY = Int((max(0, min(bounds.height, localY)) / bounds.height) * Double(capturePreset.height))
-        let cursor = TBMonitorCursor(
+        let scaledX = Int((max(0, min(bounds.width, localX)) / bounds.width) * Double(streamWidth))
+        let scaledY = Int((max(0, min(bounds.height, localY)) / bounds.height) * Double(streamHeight))
+        return TBMonitorCursor(
             x: scaledX,
             y: scaledY,
-            width: capturePreset.width,
-            height: capturePreset.height,
+            width: streamWidth,
+            height: streamHeight,
             visible: visible,
-            type: getCurrentCursorType(),
-            large: largeCursor
+            type: type,
+            large: large,
+            echo: echo,
+            pointWidth: Double(bounds.width),
+            pointHeight: Double(bounds.height)
         )
+    }
 
-        if !force, let previous = lastCursorPacket {
-            let movement = abs(previous.x - cursor.x) + abs(previous.y - cursor.y)
-            if movement < 2,
-               previous.visible == cursor.visible,
-               previous.width == cursor.width,
-               previous.height == cursor.height,
-               previous.type == cursor.type,
-               previous.large == cursor.large {
-                return
-            }
-        }
+    /// Skips packets that would not visibly change the overlay. A packet that
+    /// answers a receiver move (echo set) always goes out, so latency samples
+    /// are not held back until the cursor has moved 2 px.
+    static func shouldSendCursorPacket(_ cursor: TBMonitorCursor, after previous: TBMonitorCursor?, force: Bool) -> Bool {
+        guard !force, cursor.echo == nil, let previous else { return true }
+        let movement = abs(previous.x - cursor.x) + abs(previous.y - cursor.y)
+        return movement >= 2 ||
+            previous.visible != cursor.visible ||
+            previous.width != cursor.width ||
+            previous.height != cursor.height ||
+            previous.type != cursor.type ||
+            previous.large != cursor.large
+    }
+
+    private func sendCursorUpdateIfNeeded(force: Bool = false, location: CGPoint? = nil, echo: UInt64? = nil) {
+        guard !inputRelayActive else { return }
+        guard isConnected, isStreaming, cursorDisplayID != kCGNullDirectDisplay else { return }
+        // Right after a receiver move, the injected location is where the
+        // cursor is going even if the posted event has not been processed yet;
+        // reading the live location could send an older point after a newer
+        // one. Later, follow the live cursor (the Sender's own mouse may move).
+        let recentlyInjected = inputControlRole == .receiverMaster &&
+            ProcessInfo.processInfo.systemUptime - lastInjectedMoveUptime < 0.1
+        let injectedLocation = recentlyInjected ? injectedRemoteMouseLocation : nil
+        guard let point = location ?? injectedLocation ?? CGEvent(source: nil)?.location else { return }
+
+        guard let cursor = Self.cursorPacket(
+            at: point,
+            displayBounds: CGDisplayBounds(cursorDisplayID),
+            streamWidth: capturePreset.width,
+            streamHeight: capturePreset.height,
+            type: getCurrentCursorType(),
+            large: largeCursor,
+            echo: echo
+        ) else { return }
+
+        guard Self.shouldSendCursorPacket(cursor, after: lastCursorPacket, force: force) else { return }
 
         lastCursorPacket = cursor
         if let packet = TBMonitorProtocol.makeJSONPacket(type: .cursor, value: cursor) {
@@ -3689,6 +3825,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             defer {
                 if self.captureRestartGeneration == generation {
                     self.isRestartingCaptureAfterWake = false
+                    if self.cursorModeRestartPending {
+                        self.cursorModeRestartPending = false
+                        self.restartCaptureNow()
+                    }
                 }
             }
             // A delayed recovery must never restart a replacement connection,
@@ -3733,7 +3873,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         senderFPS = 0
         sentSnapshot = 0
         cursorDisplayID = kCGNullDirectDisplay
-        lastCursorPacket = nil
+        // Keep lastCursorPacket: if the new stream drops the overlay, it tells
+        // whether the Receiver is still drawing one that must be hidden.
 
         beginCaptureActivity()
         let started = await startCapture(for: profile)

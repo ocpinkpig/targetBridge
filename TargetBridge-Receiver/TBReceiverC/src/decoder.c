@@ -13,6 +13,7 @@
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,6 +47,17 @@ struct tb_decoder {
 
     tb_frame_cb       cb;
     void             *ud;
+
+    /* Newest decoded frame not shown yet (see tb_dec_present_latest).
+     * Decoding may run on another thread than presenting, so these four
+     * are only touched under latest_lock. */
+    pthread_mutex_t   latest_lock;
+    AVFrame          *latest;
+    int               has_latest;
+    uint64_t          decoded;
+    uint64_t          replaced;
+    /* Presenting side only: the frame being handed to the callback. */
+    AVFrame          *presenting;
 
     int               opened;
 };
@@ -94,8 +106,11 @@ struct tb_decoder *tb_dec_create(tb_frame_cb cb, void *ud) {
     d->hw_frame = av_frame_alloc();
     d->sw_frame = av_frame_alloc();
     d->nv12_frame = av_frame_alloc();
+    d->latest   = av_frame_alloc();
+    d->presenting = av_frame_alloc();
     d->pkt      = av_packet_alloc();
-    if (!d->hw_frame || !d->sw_frame || !d->nv12_frame || !d->pkt) {
+    pthread_mutex_init(&d->latest_lock, NULL);
+    if (!d->hw_frame || !d->sw_frame || !d->nv12_frame || !d->latest || !d->presenting || !d->pkt) {
         tb_dec_destroy(d); return NULL;
     }
     return d;
@@ -137,6 +152,8 @@ void tb_dec_reset(struct tb_decoder *d) {
     d->extradata      = NULL;
     d->extradata_size = 0;
     d->opened         = 0;
+    /* A frame from the previous session must never be shown in the next. */
+    tb_dec_drop_latest(d);
     /* hw_dev, hw_frame, sw_frame, pkt stay allocated for reuse. */
 }
 
@@ -147,6 +164,9 @@ void tb_dec_destroy(struct tb_decoder *d) {
     if (d->hw_frame) av_frame_free(&d->hw_frame);
     if (d->sw_frame) av_frame_free(&d->sw_frame);
     if (d->nv12_frame) av_frame_free(&d->nv12_frame);
+    if (d->latest)   av_frame_free(&d->latest);
+    if (d->presenting) av_frame_free(&d->presenting);
+    pthread_mutex_destroy(&d->latest_lock);
     if (d->pkt)      av_packet_free(&d->pkt);
     if (d->sws)      sws_freeContext(d->sws);
     av_free(d->extradata);   /* allocated with av_malloc */
@@ -339,6 +359,8 @@ static int avcc_to_annexb(struct tb_decoder *d,
     return 0;
 }
 
+static void tb_dec_emit(struct tb_decoder *d, AVFrame *frame);
+
 int tb_dec_feed_frame(struct tb_decoder *d, const uint8_t *avcc, size_t len) {
     if (!d->opened) return -1;
 
@@ -360,67 +382,117 @@ int tb_dec_feed_frame(struct tb_decoder *d, const uint8_t *avcc, size_t len) {
         if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) return 0;
         if (r < 0) { fprintf(stderr, "[dec] recv_frame=%d\n", r); return -1; }
 
+        /* Keep only the newest decoded frame; tb_dec_present_latest() shows
+         * it. When the receiver falls behind (5K 60 on an Intel Mac), frames
+         * that would be replaced before the next present cost a decode but
+         * no NV12 upload or present, so the receiver catches up instead of
+         * building a standing queue. */
+        pthread_mutex_lock(&d->latest_lock);
+        if (d->has_latest) d->replaced++;
+        av_frame_unref(d->latest);
+        av_frame_move_ref(d->latest, d->hw_frame);
+        d->has_latest = 1;
+        d->decoded++;
+        pthread_mutex_unlock(&d->latest_lock);
+    }
+}
+
+int tb_dec_present_latest(struct tb_decoder *d) {
+    if (!d) return 0;
+    pthread_mutex_lock(&d->latest_lock);
+    const int have = d->has_latest;
+    if (have) {
+        av_frame_move_ref(d->presenting, d->latest);
+        d->has_latest = 0;
+    }
+    pthread_mutex_unlock(&d->latest_lock);
+    if (!have) return 0;
+    /* Outside the lock: the upload must not stall the decoding thread. */
+    tb_dec_emit(d, d->presenting);
+    av_frame_unref(d->presenting);
+    return 1;
+}
+
+void tb_dec_drop_latest(struct tb_decoder *d) {
+    if (!d || !d->latest) return;
+    pthread_mutex_lock(&d->latest_lock);
+    av_frame_unref(d->latest);
+    d->has_latest = 0;
+    pthread_mutex_unlock(&d->latest_lock);
+}
+
+void tb_dec_take_counts(struct tb_decoder *d, uint64_t *decoded, uint64_t *replaced) {
+    if (!d) return;
+    pthread_mutex_lock(&d->latest_lock);
+    if (decoded) *decoded = d->decoded;
+    if (replaced) *replaced = d->replaced;
+    d->decoded = 0;
+    d->replaced = 0;
+    pthread_mutex_unlock(&d->latest_lock);
+}
+
+/* Hands one decoded frame to the frame callback as NV12 planes. */
+static void tb_dec_emit(struct tb_decoder *d, AVFrame *frame) {
 #if defined(__APPLE__)
-        /* Zero-copy fast path: VideoToolbox decoded frames carry a
-         * CVPixelBufferRef in data[3]. Locking its base address gives direct
-         * access to the IOSurface-backed NV12 planes without the
-         * GPU→staging→CPU copy that av_hwframe_transfer_data performs.
-         * Major win on Intel iMac + Radeon (~6× faster in practice). */
-        if (d->hw_frame->format == d->hw_pix_fmt && d->hw_frame->data[3]) {
-            CVPixelBufferRef pb = (CVPixelBufferRef)d->hw_frame->data[3];
-            if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) == 0) {
-                uint8_t *y   = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
-                size_t   ys  =            CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
-                uint8_t *uv  = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
-                size_t   uvs =            CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
-                int      w   = (int)CVPixelBufferGetWidth(pb);
-                int      h   = (int)CVPixelBufferGetHeight(pb);
-                d->cb(y, (int)ys, uv, (int)uvs, w, h, d->ud);
-                CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-            }
-            av_frame_unref(d->hw_frame);
-            continue;
+    /* Zero-copy fast path: VideoToolbox decoded frames carry a
+     * CVPixelBufferRef in data[3]. Locking its base address gives direct
+     * access to the IOSurface-backed NV12 planes without the
+     * GPU→staging→CPU copy that av_hwframe_transfer_data performs.
+     * Major win on Intel iMac + Radeon (~6× faster in practice). */
+    if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX && frame->data[3]) {
+        CVPixelBufferRef pb = (CVPixelBufferRef)frame->data[3];
+        if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) == 0) {
+            uint8_t *y   = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+            size_t   ys  =            CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+            uint8_t *uv  = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+            size_t   uvs =            CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+            int      w   = (int)CVPixelBufferGetWidth(pb);
+            int      h   = (int)CVPixelBufferGetHeight(pb);
+            d->cb(y, (int)ys, uv, (int)uvs, w, h, d->ud);
+            CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
         }
+        return;
+    }
 #endif
 
-        /* Generic path: HW transfer (Linux VAAPI / Windows D3D11VA / SW). */
-        AVFrame *out = d->hw_frame;
-        if (d->hw_frame->format == d->hw_pix_fmt) {
-            d->sw_frame->format = AV_PIX_FMT_NV12;
-            if (av_hwframe_transfer_data(d->sw_frame, d->hw_frame, 0) < 0) {
-                fprintf(stderr, "[dec] hwframe_transfer failed\n");
-                av_frame_unref(d->hw_frame);
-                continue;
-            }
-            out = d->sw_frame;
+    /* Generic path: HW transfer (Linux VAAPI / Windows D3D11VA / SW). */
+    AVFrame *out = frame;
+    /* Decided from the frame, not d->hw_pix_fmt: the decoding thread may be
+     * reopening the codec while an older frame is shown here. */
+    if (frame->hw_frames_ctx) {
+        d->sw_frame->format = AV_PIX_FMT_NV12;
+        if (av_hwframe_transfer_data(d->sw_frame, frame, 0) < 0) {
+            fprintf(stderr, "[dec] hwframe_transfer failed\n");
+            av_frame_unref(d->sw_frame);
+            return;
         }
-
-        if (out->format == AV_PIX_FMT_NV12) {
-            d->cb(out->data[0], out->linesize[0],
-                  out->data[1], out->linesize[1],
-                  out->width,   out->height, d->ud);
-        } else {
-            d->sws = sws_getCachedContext(d->sws,
-                                          out->width, out->height, (enum AVPixelFormat)out->format,
-                                          out->width, out->height, AV_PIX_FMT_NV12,
-                                          SWS_BILINEAR, NULL, NULL, NULL);
-            av_frame_unref(d->nv12_frame);
-            d->nv12_frame->format = AV_PIX_FMT_NV12;
-            d->nv12_frame->width = out->width;
-            d->nv12_frame->height = out->height;
-            if (!d->sws || av_frame_get_buffer(d->nv12_frame, 32) < 0) {
-                fprintf(stderr, "[dec] could not allocate NV12 software frame\n");
-            } else if (sws_scale(d->sws, (const uint8_t * const *)out->data, out->linesize,
-                                 0, out->height, d->nv12_frame->data, d->nv12_frame->linesize) <= 0) {
-                fprintf(stderr, "[dec] software frame conversion failed\n");
-            } else {
-                d->cb(d->nv12_frame->data[0], d->nv12_frame->linesize[0],
-                      d->nv12_frame->data[1], d->nv12_frame->linesize[1],
-                      d->nv12_frame->width, d->nv12_frame->height, d->ud);
-            }
-        }
-        av_frame_unref(d->nv12_frame);
-        av_frame_unref(d->sw_frame);
-        av_frame_unref(d->hw_frame);
+        out = d->sw_frame;
     }
+
+    if (out->format == AV_PIX_FMT_NV12) {
+        d->cb(out->data[0], out->linesize[0],
+              out->data[1], out->linesize[1],
+              out->width,   out->height, d->ud);
+    } else {
+        d->sws = sws_getCachedContext(d->sws,
+                                      out->width, out->height, (enum AVPixelFormat)out->format,
+                                      out->width, out->height, AV_PIX_FMT_NV12,
+                                      SWS_BILINEAR, NULL, NULL, NULL);
+        av_frame_unref(d->nv12_frame);
+        d->nv12_frame->format = AV_PIX_FMT_NV12;
+        d->nv12_frame->width = out->width;
+        d->nv12_frame->height = out->height;
+        if (!d->sws || av_frame_get_buffer(d->nv12_frame, 32) < 0) {
+            fprintf(stderr, "[dec] could not allocate NV12 software frame\n");
+        } else if (sws_scale(d->sws, (const uint8_t * const *)out->data, out->linesize,
+                             0, out->height, d->nv12_frame->data, d->nv12_frame->linesize) <= 0) {
+            fprintf(stderr, "[dec] software frame conversion failed\n");
+        } else {
+            d->cb(d->nv12_frame->data[0], d->nv12_frame->linesize[0],
+                  d->nv12_frame->data[1], d->nv12_frame->linesize[1],
+                  d->nv12_frame->width, d->nv12_frame->height, d->ud);
+        }
+    }
+    av_frame_unref(d->nv12_frame);
+    av_frame_unref(d->sw_frame);
 }

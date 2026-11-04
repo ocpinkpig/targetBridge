@@ -17,6 +17,9 @@
 #include "decoder.h"
 #include "display.h"
 #include "idle_watchdog.h"
+#include "timing_stats.h"
+#include "cursor_predictor.h"
+#include "decode_thread.h"
 #include "receiver_profile.h"
 #include "proto.h"
 #include "tb_gesture_bridge.h"
@@ -47,6 +50,7 @@
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
+#include <mach/mach_time.h>
 
 #define AUDIO_BUF_CAP (192000) // 1 second buffer of 48000Hz stereo 16-bit PCM
 
@@ -58,6 +62,7 @@
 struct app {
     struct tb_display *disp;
     struct tb_decoder *dec;
+    struct tb_decode_thread *decode_thread;
     struct tb_parser   parser;
 
     int      server_fd;
@@ -119,6 +124,25 @@ struct app {
 
     uint64_t input_events_sent;
     uint64_t input_events_received;
+    /* receiverMaster cursor: prediction plus the Sender's latest packet,
+     * which is shown as is whenever there is nothing to predict. */
+    struct tb_cursor_predictor cursor_predictor;
+    struct {
+        int valid;
+        int x, y, w, h;
+        int visible, type, large;
+    } last_cursor;
+    /* Latency log, one window per second (see the [latency] line). */
+    struct tb_timing_stats cursor_rtt_us;
+    /* Time between event-loop passes while streaming: the longest a mouse
+     * event or cursor packet can wait to be handled. */
+    struct tb_timing_stats loop_gap_us;
+    uint64_t last_loop_us;
+    /* Socket reads skipped because the decoder was behind (back-pressure). */
+    uint64_t throttled_reads;
+    struct tb_timing_stats input_wait_us;
+    struct tb_timing_stats predict_error_tenths_pt;
+    uint64_t last_latency_report_ms;
     uint64_t last_target_switch_ms;
     uint64_t last_space_switch_ms;
     uint64_t last_space_gesture_ms;
@@ -149,6 +173,8 @@ static void tb_receiver_input_log(const char *fmt, ...) {
     if (!home || !*home) return;
 
     char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s/Library/Application Support/TargetBridge Receiver", home);
+    mkdir(dir, 0755);  /* mkdir is not recursive: create the parent first */
     snprintf(dir, sizeof(dir), "%s/Library/Application Support/TargetBridge Receiver/Logs", home);
     mkdir(dir, 0755);
 
@@ -173,6 +199,19 @@ static uint64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
+}
+
+static uint64_t now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000ULL;
+}
+
+/* "n=… avg=…ms p50=…ms p95=…ms max=…ms" from µs samples. */
+static void tb_format_timing_ms(char *dest, size_t size, const struct tb_timing_summary *s) {
+    snprintf(dest, size, "n=%llu avg=%.1fms p50=%.1fms p95=%.1fms max=%.1fms",
+             (unsigned long long)s->count, s->avg / 1000.0, s->p50 / 1000.0,
+             s->p95 / 1000.0, s->max / 1000.0);
 }
 
 static void tb_copy_i18n(char *dest, size_t size, const char *key);
@@ -202,6 +241,7 @@ static void send_receiver_info(struct app *a);
 static void tb_receiver_apply_input_event(const uint8_t *payload, size_t len);
 static void tb_receiver_apply_input_control_mode(struct app *a, const uint8_t *payload, size_t len);
 static void tb_receiver_refresh_input_capture(struct app *a);
+static void tb_receiver_show_cursor(struct app *a);
 static void tb_receiver_set_clipboard_text(const char *text);
 static int tb_receiver_get_clipboard_text(char *dest, size_t size);
 static void tb_receiver_send_clipboard_if_changed(struct app *a);
@@ -930,6 +970,10 @@ static void tb_receiver_apply_input_control_mode(struct app *a, const uint8_t *p
         a->sent_option_down = 0;
         a->sent_control_down = 0;
         a->sent_caps_down = 0;
+        /* Unconfirmed moves no longer mean anything; show the Sender's own
+         * position from here on. Keeps the learnt display size. */
+        tb_cursor_predictor_clear_pending(&a->cursor_predictor);
+        tb_receiver_show_cursor(a);
     }
     tb_receiver_refresh_input_capture(a);
 }
@@ -1188,15 +1232,20 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
         break;
     case TB_PKT_PARAM_SETS:
         a->session_active = 1;
-        /* tb_dec_set_param_sets is now a no-op if the sets are unchanged,
-         * so we don't spam a log line per keyframe. */
-        tb_dec_set_param_sets(a->dec, payload, len);
+        /* tb_dec_set_param_sets is a no-op if the sets are unchanged, so
+         * this does not log a line per keyframe. Ordered with the frames on
+         * the decode thread. */
+        tb_decode_thread_queue_params(a->decode_thread, payload, len);
         break;
     case TB_PKT_FRAME:
+        /* Decoded on the decode thread; the loop shows the newest result
+         * (tb_dec_present_latest) so decoding never blocks input. */
         a->session_active = 1;
-        tb_dec_feed_frame(a->dec, payload, len);
+        tb_decode_thread_queue_frame(a->decode_thread, payload, len);
         break;
     case TB_PKT_RAW_FRAME:
+        /* Uncompressed frames point into the packet buffer, so they are shown
+         * immediately rather than deferred like decoded ones. */
         a->session_active = 1;
         handle_raw_frame(a, payload, len);
         break;
@@ -1216,7 +1265,30 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
             (void)extract_json_bool_field(payload, len, "\"visible\"", &visible);
             (void)extract_json_int_field(payload, len, "\"type\"", &type);
             (void)extract_json_bool_field(payload, len, "\"large\"", &large);
-            tb_disp_set_cursor(a->disp, x, y, w, h, visible, type, large);
+            double echo = 0;
+            double point_w = 0;
+            double point_h = 0;
+            (void)extract_json_double_field(payload, len, "\"pointWidth\"", &point_w);
+            (void)extract_json_double_field(payload, len, "\"pointHeight\"", &point_h);
+            if (!extract_json_double_field(payload, len, "\"echo\"", &echo) || echo < 0) echo = 0;
+            if (echo > 0) {
+                tb_timing_stats_add_elapsed(&a->cursor_rtt_us, (uint64_t)echo, now_us());
+            }
+            uint64_t error_tenths_pt = 0;
+            if (tb_cursor_predictor_on_cursor(&a->cursor_predictor, x, y, w, h, visible,
+                                              point_w, point_h, (uint64_t)echo,
+                                              &error_tenths_pt)) {
+                tb_timing_stats_add(&a->predict_error_tenths_pt, error_tenths_pt);
+            }
+            a->last_cursor.valid = 1;
+            a->last_cursor.x = x;
+            a->last_cursor.y = y;
+            a->last_cursor.w = w;
+            a->last_cursor.h = h;
+            a->last_cursor.visible = visible;
+            a->last_cursor.type = type;
+            a->last_cursor.large = large;
+            tb_receiver_show_cursor(a);
         }
         break;
     case TB_PKT_BRIGHTNESS:
@@ -1313,10 +1385,25 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
 
 /* ---- Networking helpers ---------------------------------------------- */
 
+/* Longest one drain may spend reading and decoding before the loop shows the
+ * newest frame and sends input again; anything left is read next pass. */
+#define TB_DRAIN_BUDGET_US 16000
+
 static int drain_socket(struct app *a) {
-    uint8_t buf[1024 * 1024];
+    /* 256 KB reads keep the back-pressure check close to frame granularity
+     * (a 5K frame is roughly 100-500 KB). */
+    static uint8_t buf[256 * 1024];
     int saw_data = 0;
+    const uint64_t started = now_us();
     for (;;) {
+        if (saw_data && now_us() - started >= TB_DRAIN_BUDGET_US) return saw_data;
+        /* The decoder is behind: leave the rest in the socket so TCP slows
+         * the Sender (which then drops frames before encoding) instead of
+         * queueing video here. Reading resumes as soon as a frame is done. */
+        if (!tb_decode_thread_wants_frames(a->decode_thread)) {
+            a->throttled_reads++;
+            return saw_data;
+        }
         ssize_t n = read(a->client_fd, buf, sizeof(buf));
         if (n > 0) {
             saw_data = 1;
@@ -1365,27 +1452,35 @@ static int send_all(int fd, const uint8_t *buf, size_t len) {
     return 0;
 }
 
-static void tb_receiver_send_input_event(struct app *a,
-                                         const char *kind,
-                                         int has_dx, int dx,
-                                         int has_dy, int dy,
-                                         int has_scroll_x, int scroll_x,
-                                         int has_scroll_y, int scroll_y,
-                                         int has_key_code, uint16_t key_code) {
-    if (!a || a->client_fd < 0) return;
-    if (strcmp(a->input_control_mode, "receiverMaster") != 0) return;
+/* Returns the send stamp of a move/drag that was sent, 0 otherwise. */
+static uint64_t tb_receiver_send_input_event(struct app *a,
+                                             const char *kind,
+                                             int has_dx, int dx,
+                                             int has_dy, int dy,
+                                             int has_scroll_x, int scroll_x,
+                                             int has_scroll_y, int scroll_y,
+                                             int has_key_code, uint16_t key_code) {
+    if (!a || a->client_fd < 0) return 0;
+    if (strcmp(a->input_control_mode, "receiverMaster") != 0) return 0;
 
     char json[256];
     int len = snprintf(json, sizeof(json), "{\"kind\":\"%s\"", kind ? kind : "");
-    if (len <= 0 || (size_t)len >= sizeof(json)) return;
+    if (len <= 0 || (size_t)len >= sizeof(json)) return 0;
 
     if (has_dx) len += snprintf(json + len, sizeof(json) - (size_t)len, ",\"dx\":%d", dx);
     if (has_dy) len += snprintf(json + len, sizeof(json) - (size_t)len, ",\"dy\":%d", dy);
     if (has_scroll_x) len += snprintf(json + len, sizeof(json) - (size_t)len, ",\"scrollX\":%d", scroll_x);
     if (has_scroll_y) len += snprintf(json + len, sizeof(json) - (size_t)len, ",\"scrollY\":%d", scroll_y);
     if (has_key_code) len += snprintf(json + len, sizeof(json) - (size_t)len, ",\"keyCode\":%u", (unsigned int)key_code);
+    /* Moves and drags carry a send stamp the Sender echoes in its next cursor
+     * packet, so the round trip can be timed on this Mac's clock alone. */
+    uint64_t stamp = 0;
+    if (has_dx && has_dy) {
+        stamp = now_us();
+        len += snprintf(json + len, sizeof(json) - (size_t)len, ",\"t\":%llu", (unsigned long long)stamp);
+    }
     len += snprintf(json + len, sizeof(json) - (size_t)len, "}");
-    if (len <= 0 || (size_t)len >= sizeof(json)) return;
+    if (len <= 0 || (size_t)len >= sizeof(json)) return 0;
 
     uint8_t pkt[4 + 1 + sizeof(json)];
     write_be32(pkt, (uint32_t)(1 + len));
@@ -1403,7 +1498,67 @@ static void tb_receiver_send_input_event(struct app *a,
                               has_key_code ? (unsigned int)key_code : 0,
                               a->input_control_mode);
     }
-    (void)send_all(a->client_fd, pkt, 5 + (size_t)len);
+    if (send_all(a->client_fd, pkt, 5 + (size_t)len) < 0) return 0;
+    return stamp;
+}
+
+/* How long a queued SDL motion event waited before being sent, in µs. */
+static uint64_t sdl_input_wait_us(const struct tb_input_event *event) {
+    if (!event || event->timestamp_ms == 0) return 0;
+    const uint32_t now = SDL_GetTicks();
+    const uint32_t waited = now - event->timestamp_ms;
+    return waited < 1000 ? (uint64_t)waited * 1000ULL : 0;
+}
+
+/* Shows the predicted cursor while moves are unconfirmed, otherwise the
+ * Sender's latest packet. */
+static void tb_receiver_show_cursor(struct app *a) {
+    if (!a || !a->last_cursor.valid) return;
+    int x = a->last_cursor.x;
+    int y = a->last_cursor.y;
+    int visible = a->last_cursor.visible;
+    if (strcmp(a->input_control_mode, "receiverMaster") == 0) {
+        int px, py, pvisible;
+        if (tb_cursor_predictor_position(&a->cursor_predictor, now_us(), &px, &py, &pvisible)) {
+            x = px;
+            y = py;
+            visible = pvisible;
+        }
+    }
+    tb_disp_set_cursor(a->disp, x, y, a->last_cursor.w, a->last_cursor.h,
+                       visible, a->last_cursor.type, a->last_cursor.large);
+}
+
+/* How long ago the HID system stamped this event, in µs; 0 if unknown.
+ * CGEventGetTimestamp is documented as nanoseconds but has been
+ * mach_absolute_time ticks in practice (not the same unit on Apple Silicon),
+ * so match it against both clocks and ignore anything implausible. */
+static uint64_t tb_event_age_us(CGEventRef event) {
+    const uint64_t ts = CGEventGetTimestamp(event);
+    if (ts == 0) return 0;
+    static mach_timebase_info_data_t timebase;
+    if (timebase.denom == 0) mach_timebase_info(&timebase);
+    const uint64_t now_ticks = mach_absolute_time();
+    const uint64_t now_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    const uint64_t max_age_ns = 1000000000ULL;
+    if (ts <= now_ticks) {
+        const uint64_t age_ns = (now_ticks - ts) * timebase.numer / timebase.denom;
+        if (age_ns < max_age_ns) return age_ns / 1000;
+    }
+    if (ts <= now_ns && now_ns - ts < max_age_ns) return (now_ns - ts) / 1000;
+    return 0;
+}
+
+/* Sends a move/drag and shows where it puts the cursor right away, without
+ * waiting for the Sender's answer. input_wait_us: how long the event waited
+ * before this send (0 when unknown). */
+static void tb_receiver_send_pointer_move(struct app *a, const char *kind,
+                                          int dx, int dy, uint64_t input_wait_us) {
+    const uint64_t stamp = tb_receiver_send_input_event(a, kind, 1, dx, 1, dy, 0, 0, 0, 0, 0, 0);
+    if (!stamp) return;
+    if (input_wait_us) tb_timing_stats_add(&a->input_wait_us, input_wait_us);
+    tb_cursor_predictor_on_move(&a->cursor_predictor, stamp, dx, dy);
+    tb_receiver_show_cursor(a);
 }
 
 static void tb_receiver_send_input_button_event(struct app *a,
@@ -1546,7 +1701,7 @@ static CGEventRef tb_receiver_input_tap_callback(CGEventTapProxy proxy,
         if (type == kCGEventLeftMouseDragged) kind = "leftDrag";
         else if (type == kCGEventRightMouseDragged) kind = "rightDrag";
         else if (type == kCGEventOtherMouseDragged) kind = "otherDrag";
-        tb_receiver_send_input_event(a, kind, 1, dx, 1, dy, 0, 0, 0, 0, 0, 0);
+        tb_receiver_send_pointer_move(a, kind, dx, dy, tb_event_age_us(event));
         should_consume = a->input_tap_consumes_events;
         break;
     }
@@ -1908,6 +2063,8 @@ static void close_client(struct app *a) {
     a->close_requested = 0;
     a->have_video_frame = 0;
     snprintf(a->input_control_mode, sizeof(a->input_control_mode), "off");
+    tb_cursor_predictor_reset(&a->cursor_predictor);
+    a->last_cursor.valid = 0;
     SDL_EnableScreenSaver();
     tb_receiver_refresh_input_capture(a);
     tb_disp_set_connection_state(a->disp, 0);
@@ -1916,7 +2073,7 @@ static void close_client(struct app *a) {
     a->last_clipboard_text[0] = '\0';
     tb_parser_free(&a->parser);
     tb_parser_init(&a->parser, on_packet, a);
-    tb_dec_reset(a->dec);   /* fresh decoder for next session */
+    tb_decode_thread_reset(a->decode_thread);   /* fresh decoder for next session */
     tb_audio_close_for_idle(a);
     fprintf(stderr, "[main] client disconnected\n");
 }
@@ -2060,6 +2217,8 @@ int main(int argc, char **argv) {
 
     a.dec = tb_dec_create(on_frame, &a);
     if (!a.dec) { fprintf(stderr, "tb_dec_create failed\n"); tb_disp_destroy(a.disp); return 1; }
+    a.decode_thread = tb_decode_thread_create(a.dec);
+    if (!a.decode_thread) { tb_dec_destroy(a.dec); tb_disp_destroy(a.disp); return 1; }
 
     tb_parser_init(&a.parser, on_packet, &a);
 
@@ -2070,9 +2229,22 @@ int main(int argc, char **argv) {
     a.last_ip_check_ms = 0;
 
     while (!g_term) {
+        {
+            const uint64_t loop_now = now_us();
+            if (a.client_fd >= 0 && a.have_video_frame) {
+                tb_timing_stats_add_elapsed(&a.loop_gap_us, a.last_loop_us, loop_now);
+            }
+            a.last_loop_us = loop_now;
+        }
         unsigned int disp_actions = tb_disp_poll_actions(a.disp);
         int socket_activity = 0;
-        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, true);
+        /* Service every ready run-loop source, not just one: the global input
+         * tap delivers each mouse event as its own message, and one per pass
+         * would let them queue behind a busy (5K) loop. Capped so a flood
+         * cannot starve video. */
+        for (int pass = 0; pass < 256; pass++) {
+            if (CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, true) != kCFRunLoopRunHandledSource) break;
+        }
         if (disp_actions & TB_DISP_ACTION_QUIT) break;
         if ((disp_actions & TB_DISP_ACTION_CYCLE_LANGUAGE) && a.client_fd < 0) {
             tb_receiver_cycle_language_preference(&a);
@@ -2131,6 +2303,78 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* Send receiverMaster input before reading the socket: at 5K a
+         * drain can decode and present several frames, and mouse events
+         * polled above would otherwise wait behind all of it. */
+        if (strcmp(a.input_control_mode, "receiverMaster") == 0 && a.client_fd >= 0) {
+            if (t - a.last_clipboard_poll_ms >= 100) {
+                a.last_clipboard_poll_ms = t;
+                tb_receiver_send_clipboard_if_changed(&a);
+            }
+            struct tb_input_event input_event;
+            while (tb_disp_pop_input_event(a.disp, &input_event)) {
+                switch (input_event.kind) {
+                case TB_INPUT_EVENT_MOVE:
+                    tb_receiver_send_pointer_move(&a, "move", input_event.dx, input_event.dy, sdl_input_wait_us(&input_event));
+                    break;
+                case TB_INPUT_EVENT_LEFT_DRAG:
+                    tb_receiver_send_pointer_move(&a, "leftDrag", input_event.dx, input_event.dy, sdl_input_wait_us(&input_event));
+                    break;
+                case TB_INPUT_EVENT_RIGHT_DRAG:
+                    tb_receiver_send_pointer_move(&a, "rightDrag", input_event.dx, input_event.dy, sdl_input_wait_us(&input_event));
+                    break;
+                case TB_INPUT_EVENT_OTHER_DRAG:
+                    tb_receiver_send_pointer_move(&a, "otherDrag", input_event.dx, input_event.dy, sdl_input_wait_us(&input_event));
+                    break;
+                case TB_INPUT_EVENT_SCROLL:
+                    tb_receiver_send_input_event(&a, "scroll", 0, 0, 0, 0, 1, input_event.scroll_x, 1, input_event.scroll_y, 0, 0);
+                    break;
+                case TB_INPUT_EVENT_LEFT_DOWN:
+                    tb_receiver_send_input_button_event(&a, "leftDown", input_event.click_count);
+                    break;
+                case TB_INPUT_EVENT_LEFT_UP:
+                    tb_receiver_send_input_button_event(&a, "leftUp", input_event.click_count);
+                    break;
+                case TB_INPUT_EVENT_RIGHT_DOWN:
+                    tb_receiver_send_input_button_event(&a, "rightDown", input_event.click_count);
+                    break;
+                case TB_INPUT_EVENT_RIGHT_UP:
+                    tb_receiver_send_input_button_event(&a, "rightUp", input_event.click_count);
+                    break;
+                case TB_INPUT_EVENT_OTHER_DOWN:
+                    tb_receiver_send_input_button_event(&a, "otherDown", input_event.click_count);
+                    break;
+                case TB_INPUT_EVENT_OTHER_UP:
+                    tb_receiver_send_input_button_event(&a, "otherUp", input_event.click_count);
+                    break;
+                case TB_INPUT_EVENT_KEY_DOWN:
+                    tb_receiver_send_input_event(&a, "keyDown", 0, 0, 0, 0, 0, 0, 0, 0, 1, input_event.key_code);
+                    break;
+                case TB_INPUT_EVENT_KEY_UP:
+                    tb_receiver_send_input_event(&a, "keyUp", 0, 0, 0, 0, 0, 0, 0, 0, 1, input_event.key_code);
+                    break;
+                case TB_INPUT_EVENT_SWITCH_PREV_TARGET:
+                    tb_receiver_send_target_switch(&a, -1);
+                    break;
+                case TB_INPUT_EVENT_SWITCH_NEXT_TARGET:
+                    tb_receiver_send_target_switch(&a, 1);
+                    break;
+                case TB_INPUT_EVENT_SWITCH_PREV_SPACE:
+                    tb_receiver_send_space_switch(&a, -1);
+                    break;
+                case TB_INPUT_EVENT_SWITCH_NEXT_SPACE:
+                    tb_receiver_send_space_switch(&a, 1);
+                    break;
+                case TB_INPUT_EVENT_DEACTIVATE_CONTROL:
+                    tb_receiver_send_deactivate_control(&a);
+                    break;
+                case TB_INPUT_EVENT_NONE:
+                default:
+                    break;
+                }
+            }
+        }
+
         /* Accept new client */
         if (a.client_fd < 0) {
             int c = tb_net_accept(a.server_fd);
@@ -2154,6 +2398,14 @@ int main(int argc, char **argv) {
                 close_client(&a);
             } else {
                 socket_activity = drain_result;
+                /* Show the newest frame the decode thread finished, if any:
+                 * when it is behind, older ones are skipped rather than
+                 * queued (5K 60 lag). Runs every pass, not only after reads,
+                 * since decoding finishes asynchronously. */
+                tb_dec_present_latest(a.dec);
+                /* Show a cursor move now rather than with the next video
+                 * frame, which only comes when the screen content changes. */
+                tb_disp_flush_cursor(a.disp);
                 if (drain_result > 0) a.last_recv_ms = now_ms();
                 if (a.close_requested) {
                     close_client(&a);
@@ -2205,81 +2457,83 @@ int main(int argc, char **argv) {
             tb_disp_render_connecting(a.disp);
         }
 
-        if (strcmp(a.input_control_mode, "receiverMaster") == 0 && a.client_fd >= 0) {
-            if (t - a.last_clipboard_poll_ms >= 100) {
-                a.last_clipboard_poll_ms = t;
-                tb_receiver_send_clipboard_if_changed(&a);
-            }
-            struct tb_input_event input_event;
-            while (tb_disp_pop_input_event(a.disp, &input_event)) {
-                switch (input_event.kind) {
-                case TB_INPUT_EVENT_MOVE:
-                    tb_receiver_send_input_event(&a, "move", 1, input_event.dx, 1, input_event.dy, 0, 0, 0, 0, 0, 0);
-                    break;
-                case TB_INPUT_EVENT_LEFT_DRAG:
-                    tb_receiver_send_input_event(&a, "leftDrag", 1, input_event.dx, 1, input_event.dy, 0, 0, 0, 0, 0, 0);
-                    break;
-                case TB_INPUT_EVENT_RIGHT_DRAG:
-                    tb_receiver_send_input_event(&a, "rightDrag", 1, input_event.dx, 1, input_event.dy, 0, 0, 0, 0, 0, 0);
-                    break;
-                case TB_INPUT_EVENT_OTHER_DRAG:
-                    tb_receiver_send_input_event(&a, "otherDrag", 1, input_event.dx, 1, input_event.dy, 0, 0, 0, 0, 0, 0);
-                    break;
-                case TB_INPUT_EVENT_SCROLL:
-                    tb_receiver_send_input_event(&a, "scroll", 0, 0, 0, 0, 1, input_event.scroll_x, 1, input_event.scroll_y, 0, 0);
-                    break;
-                case TB_INPUT_EVENT_LEFT_DOWN:
-                    tb_receiver_send_input_button_event(&a, "leftDown", input_event.click_count);
-                    break;
-                case TB_INPUT_EVENT_LEFT_UP:
-                    tb_receiver_send_input_button_event(&a, "leftUp", input_event.click_count);
-                    break;
-                case TB_INPUT_EVENT_RIGHT_DOWN:
-                    tb_receiver_send_input_button_event(&a, "rightDown", input_event.click_count);
-                    break;
-                case TB_INPUT_EVENT_RIGHT_UP:
-                    tb_receiver_send_input_button_event(&a, "rightUp", input_event.click_count);
-                    break;
-                case TB_INPUT_EVENT_OTHER_DOWN:
-                    tb_receiver_send_input_button_event(&a, "otherDown", input_event.click_count);
-                    break;
-                case TB_INPUT_EVENT_OTHER_UP:
-                    tb_receiver_send_input_button_event(&a, "otherUp", input_event.click_count);
-                    break;
-                case TB_INPUT_EVENT_KEY_DOWN:
-                    tb_receiver_send_input_event(&a, "keyDown", 0, 0, 0, 0, 0, 0, 0, 0, 1, input_event.key_code);
-                    break;
-                case TB_INPUT_EVENT_KEY_UP:
-                    tb_receiver_send_input_event(&a, "keyUp", 0, 0, 0, 0, 0, 0, 0, 0, 1, input_event.key_code);
-                    break;
-                case TB_INPUT_EVENT_SWITCH_PREV_TARGET:
-                    tb_receiver_send_target_switch(&a, -1);
-                    break;
-                case TB_INPUT_EVENT_SWITCH_NEXT_TARGET:
-                    tb_receiver_send_target_switch(&a, 1);
-                    break;
-                case TB_INPUT_EVENT_SWITCH_PREV_SPACE:
-                    tb_receiver_send_space_switch(&a, -1);
-                    break;
-                case TB_INPUT_EVENT_SWITCH_NEXT_SPACE:
-                    tb_receiver_send_space_switch(&a, 1);
-                    break;
-                case TB_INPUT_EVENT_DEACTIVATE_CONTROL:
-                    tb_receiver_send_deactivate_control(&a);
-                    break;
-                case TB_INPUT_EVENT_NONE:
-                default:
-                    break;
-                }
-            }
-        }
-
         /* FPS log */
         if (t - a.last_fps_tick_ms >= 1000) {
             uint64_t df = a.frames - a.last_fps_count;
             a.last_fps_count   = a.frames;
             a.last_fps_tick_ms = t;
             if (df > 0) fprintf(stderr, "[main] %llu fps\n", (unsigned long long)df);
+        }
+
+        /* Latency log, once a second while the mouse is moving:
+         *   [latency] rtt     = move sent → Sender's answering cursor packet;
+         *             wait    = mouse event → sent (tap: from the HID stamp;
+         *                       SDL: from SDL's own event pump);
+         *             predict = how far prediction was off when confirmed;
+         *             draw    = cursor packet → presented (SDL-drawn cursor
+         *                       only; the layer shows immediately).
+         *   [frames]  decoded/shown/skipped per second (skipped = replaced
+         *             by a newer frame before it could be shown, i.e. the
+         *             receiver was behind), throttled = socket reads put off
+         *             because the decoder was behind (the Sender is being
+         *             slowed), then decode, upload (NV12 → texture),
+         *             present time and the event-loop gap. Also logged
+         *             whenever frames were skipped or reads throttled. */
+        if (t - a.last_latency_report_ms >= 1000) {
+            a.last_latency_report_ms = t;
+            struct tb_timing_summary rtt, wait, predict, decode, upload, present;
+            uint64_t draws = 0, draw_sum_us = 0, draw_max_us = 0;
+            uint64_t decoded = 0, skipped = 0;
+            tb_disp_take_cursor_draw_stats(a.disp, &draws, &draw_sum_us, &draw_max_us);
+            tb_dec_take_counts(a.dec, &decoded, &skipped);
+            const int have_rtt = tb_timing_stats_take_summary(&a.cursor_rtt_us, &rtt);
+            const int have_wait = tb_timing_stats_take_summary(&a.input_wait_us, &wait);
+            const int have_predict = tb_timing_stats_take_summary(&a.predict_error_tenths_pt, &predict);
+            const int have_decode = tb_decode_thread_take_decode_stats(a.decode_thread, &decode);
+            const int have_split = tb_disp_take_frame_stats(a.disp, &upload, &present);
+            const uint64_t throttled = a.throttled_reads;
+            a.throttled_reads = 0;
+            if ((have_decode || have_split) && (have_rtt || have_wait || skipped > 0 || throttled > 0)) {
+                char decode_text[96] = "-", upload_text[96] = "-", present_text[96] = "-";
+                if (have_decode) tb_format_timing_ms(decode_text, sizeof(decode_text), &decode);
+                if (have_split) {
+                    tb_format_timing_ms(upload_text, sizeof(upload_text), &upload);
+                    tb_format_timing_ms(present_text, sizeof(present_text), &present);
+                }
+                struct tb_timing_summary loop_gap;
+                char loop_text[96] = "-";
+                if (tb_timing_stats_take_summary(&a.loop_gap_us, &loop_gap)) {
+                    snprintf(loop_text, sizeof(loop_text), "p95=%.1fms max=%.1fms",
+                             loop_gap.p95 / 1000.0, loop_gap.max / 1000.0);
+                }
+                tb_receiver_input_log("[frames] decoded=%llu shown=%llu skipped=%llu throttled=%llu | decode %s | upload %s | present %s | loop gap %s",
+                                      (unsigned long long)decoded,
+                                      (unsigned long long)(have_split ? upload.count : 0),
+                                      (unsigned long long)skipped,
+                                      (unsigned long long)throttled,
+                                      decode_text, upload_text, present_text, loop_text);
+            } else {
+                /* Keep the loop-gap window to the same second as the rest. */
+                struct tb_timing_summary unused;
+                (void)tb_timing_stats_take_summary(&a.loop_gap_us, &unused);
+            }
+            if (have_rtt || have_wait) {
+                char rtt_text[96] = "-", wait_text[96] = "-", predict_text[96] = "off", draw_text[64] = "layer";
+                if (have_rtt) tb_format_timing_ms(rtt_text, sizeof(rtt_text), &rtt);
+                if (have_wait) tb_format_timing_ms(wait_text, sizeof(wait_text), &wait);
+                if (have_predict) {
+                    snprintf(predict_text, sizeof(predict_text), "n=%llu avg=%.1fpt p95=%.1fpt max=%.1fpt",
+                             (unsigned long long)predict.count, predict.avg / 10.0,
+                             predict.p95 / 10.0, predict.max / 10.0);
+                }
+                if (draws) {
+                    snprintf(draw_text, sizeof(draw_text), "n=%llu avg=%.1fms max=%.1fms",
+                             (unsigned long long)draws,
+                             (double)draw_sum_us / (double)draws / 1000.0, draw_max_us / 1000.0);
+                }
+                tb_receiver_input_log("[latency] rtt %s | wait %s | predict %s | draw %s",
+                                      rtt_text, wait_text, predict_text, draw_text);
+            }
         }
 
         /* Yield when idle or when a nonblocking active socket had no data,
@@ -2294,6 +2548,7 @@ int main(int argc, char **argv) {
     if (a.server_fd >= 0) close(a.server_fd);
     bonjour_deinit(&a);
     tb_parser_free(&a.parser);
+    tb_decode_thread_destroy(a.decode_thread);   /* joins before the decoder goes */
     tb_dec_destroy(a.dec);
     tb_audio_close_for_idle(&a);
     tb_disp_destroy(a.disp);
