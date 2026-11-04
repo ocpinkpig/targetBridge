@@ -10,7 +10,7 @@ set -euo pipefail
 # Usage:
 #   targetbridge connect [--receiver auto|<id|name|ip>] [--mode mirror|extended]
 #                        [--preset <name>] [--path auto|wired|thunderbolt|usb|ethernet|wifi]
-#                        [--transport tb|net] [--session N] [--local-ip <ip>] [--retry]
+#                        [--transport tb|usb|net] [--session N] [--local-ip <ip>] [--retry]
 #   targetbridge disconnect [--session N]
 #
 # Examples:

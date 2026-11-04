@@ -93,6 +93,8 @@
   "sender.diagnostics.local_link_missing": "Wähle vor dem Verbinden eine aktive lokale Schnittstelle.",
   "sender.diagnostics.thunderbolt_link_ready": "Thunderbolt Bridge ist auf %{interface} ausgewählt.",
   "sender.diagnostics.thunderbolt_link_unexpected": "Thunderbolt Bridge ist ausgewählt, aber %{interface} ist keine Bridge-Schnittstelle.",
+  "sender.diagnostics.usb_link_ready": "Direct USB ist auf %{interface} ausgewählt.",
+  "sender.diagnostics.usb_link_unexpected": "Direct USB erwartet eine USB-Netzwerkschnittstelle (en…), aber %{interface} ist ausgewählt.",
   "sender.diagnostics.network_link_selected": "Network Link ist auf %{interface} ausgewählt; die Latenz kann variieren.",
   "sender.diagnostics.receiver_address": "Receiver-Adresse",
   "sender.diagnostics.receiver_address_missing": "Gib eine Receiver-Adresse ein oder wähle eine aus.",

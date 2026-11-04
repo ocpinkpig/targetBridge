@@ -49,7 +49,11 @@ enum TBConnectionPathKind: String, CaseIterable {
     case wifi
 
     var transportKind: TBTransportKind {
-        self == .thunderbolt ? .thunderboltBridge : .networkLink
+        switch self {
+        case .thunderbolt: return .thunderboltBridge
+        case .usb: return .directUSB
+        case .ethernet, .wifi: return .networkLink
+        }
     }
 
     fileprivate var tieBreakPriority: Int {
@@ -141,6 +145,31 @@ enum TBConnectionDiagnostics {
             return false
         }
         return first == 169 && second == 254
+    }
+
+    /// Classifies a local interface for the sender's transport picker; nil means
+    /// the interface is not a usable link (loopback, tunnels, AWDL, public IPs).
+    static func transportKind(forInterfaceName name: String, ip: String) -> TBTransportKind? {
+        if name.hasPrefix("bridge"), isIPv4LinkLocal(ip) {
+            return .thunderboltBridge
+        }
+        if isDirectLinkInterface(name: name, ip: ip) {
+            return .directUSB
+        }
+        // bridge* + private IP covers macOS Internet Sharing (bridge100).
+        if name.hasPrefix("en") || name.hasPrefix("eth") || name.hasPrefix("bridge"),
+           isPrivateIPv4(ip) {
+            return .networkLink
+        }
+        return nil
+    }
+
+    /// Direct links (USB-NCM, Thunderbolt Bridge) share 169.254/16 with the primary
+    /// interface, so their dials must be bound to the interface that owns the link.
+    static func shouldPinEgressInterface(transport: TBTransportKind, interfaceName: String?) -> Bool {
+        guard transport == .directUSB || transport == .thunderboltBridge else { return false }
+        guard let interfaceName, !interfaceName.isEmpty else { return false }
+        return true
     }
 
     static func isIPv4LinkLocal(_ ip: String) -> Bool {
@@ -524,5 +553,47 @@ enum TBConnectionDiagnostics {
             interfaces.append(LocalInterface(name: String(cString: iface.pointee.ifa_name), ip: String(cString: buffer)))
         }
         return interfaces
+    }
+}
+
+/// Caches the interfaces Network.framework currently knows about so `connect()`
+/// can resolve an `NWInterface` by name without blocking the main actor.
+final class TBNetworkInterfaceCache: @unchecked Sendable {
+    static let shared = TBNetworkInterfaceCache()
+
+    private let lock = NSLock()
+    private let queue = DispatchQueue(label: "fd.tbdisplaysender.interface-cache", qos: .utility)
+    private var monitor: NWPathMonitor?
+    private var interfaces: [NWInterface] = []
+
+    private init() {}
+
+    /// Idempotent; the monitor lives for the lifetime of the app.
+    func start() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard monitor == nil else { return }
+
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let self else { return }
+            self.lock.lock()
+            self.interfaces = path.availableInterfaces
+            self.lock.unlock()
+        }
+        self.monitor = monitor
+        monitor.start(queue: queue)
+    }
+
+    var isPopulated: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !interfaces.isEmpty
+    }
+
+    func interface(named name: String) -> NWInterface? {
+        lock.lock()
+        defer { lock.unlock() }
+        return interfaces.first { $0.name == name }
     }
 }

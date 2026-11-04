@@ -279,4 +279,48 @@ final class TBConnectionDiagnosticsTests: XCTestCase {
         )
         XCTAssertNil(TBConnectionDiagnostics.selectBestMeasurement([wifi], preference: .wired))
     }
+
+    func testPathKindMapsToTransportKind() {
+        XCTAssertEqual(TBConnectionPathKind.thunderbolt.transportKind, .thunderboltBridge)
+        XCTAssertEqual(TBConnectionPathKind.usb.transportKind, .directUSB)
+        XCTAssertEqual(TBConnectionPathKind.ethernet.transportKind, .networkLink)
+        XCTAssertEqual(TBConnectionPathKind.wifi.transportKind, .networkLink)
+    }
+
+    func testInterfaceClassificationByTransport() {
+        let cases: [(String, String, TBTransportKind?)] = [
+            ("bridge0", "169.254.109.86", .thunderboltBridge),
+            ("en8", "169.254.190.84", .directUSB),
+            ("eth2", "169.254.1.2", .directUSB),
+            ("en0", "192.168.1.225", .networkLink),
+            ("en0", "10.0.0.5", .networkLink),
+            ("en0", "172.16.0.1", .networkLink),
+            ("en0", "172.31.255.1", .networkLink),
+            ("bridge100", "192.168.2.1", .networkLink),
+            ("en0", "172.32.0.1", nil),
+            ("en0", "8.8.8.8", nil),
+            ("utun3", "10.0.0.1", nil),
+            ("awdl0", "169.254.3.3", nil),
+            ("lo0", "127.0.0.1", nil),
+            ("en8", "169.254.300.1", nil),
+        ]
+        for (name, ip, expected) in cases {
+            XCTAssertEqual(TBConnectionDiagnostics.transportKind(forInterfaceName: name, ip: ip), expected, "\(name) \(ip)")
+        }
+    }
+
+    func testEthernetWithoutDHCPIsDirectUSBCandidate() {
+        XCTAssertEqual(TBConnectionDiagnostics.transportKind(forInterfaceName: "en0", ip: "169.254.3.4"), .directUSB)
+    }
+
+    func testPinsEgressForDirectLinkTransports() {
+        XCTAssertTrue(TBConnectionDiagnostics.shouldPinEgressInterface(transport: .directUSB, interfaceName: "en8"))
+        XCTAssertTrue(TBConnectionDiagnostics.shouldPinEgressInterface(transport: .thunderboltBridge, interfaceName: "bridge0"))
+        XCTAssertFalse(TBConnectionDiagnostics.shouldPinEgressInterface(transport: .networkLink, interfaceName: "en0"))
+    }
+
+    func testPinningIsSkippedWhenInterfaceIsUnknown() {
+        XCTAssertFalse(TBConnectionDiagnostics.shouldPinEgressInterface(transport: .directUSB, interfaceName: nil))
+        XCTAssertFalse(TBConnectionDiagnostics.shouldPinEgressInterface(transport: .directUSB, interfaceName: ""))
+    }
 }

@@ -17,7 +17,9 @@ struct TBConfigurationCheck: Identifiable, Equatable {
 struct TBConfigurationDiagnosticSnapshot {
     var hasScreenRecording: Bool
     var transportIsThunderbolt: Bool
+    var transportIsDirectUSB: Bool = false
     var localInterfaceName: String?
+    var localInterfaceIP: String? = nil
     var receiverAddress: String
     var receiverProfileAvailable: Bool
     var receiverSupportsHEVC: Bool?
@@ -50,7 +52,19 @@ enum TBConfigurationDiagnostics {
         guard let interface = snapshot.localInterfaceName, !interface.isEmpty else {
             return check("local_link", .attention, "sender.diagnostics.local_link", "sender.diagnostics.local_link_missing")
         }
-        let isBridge = interface.lowercased().hasPrefix("bridge")
+        let name = interface.lowercased()
+        if snapshot.transportIsDirectUSB {
+            let isUSBInterface: Bool
+            if let ip = snapshot.localInterfaceIP, !ip.isEmpty {
+                isUSBInterface = TBConnectionDiagnostics.transportKind(forInterfaceName: name, ip: ip) == .directUSB
+            } else {
+                isUSBInterface = name.hasPrefix("en") || name.hasPrefix("eth")
+            }
+            let state: TBConfigurationCheckState = isUSBInterface ? .passed : .attention
+            let detail = isUSBInterface ? "sender.diagnostics.usb_link_ready" : "sender.diagnostics.usb_link_unexpected"
+            return check("local_link", state, "sender.diagnostics.local_link", detail, ["interface": interface])
+        }
+        let isBridge = name.hasPrefix("bridge")
         let state: TBConfigurationCheckState = snapshot.transportIsThunderbolt && !isBridge ? .attention : .passed
         let detail = snapshot.transportIsThunderbolt
             ? (isBridge ? "sender.diagnostics.thunderbolt_link_ready" : "sender.diagnostics.thunderbolt_link_unexpected")

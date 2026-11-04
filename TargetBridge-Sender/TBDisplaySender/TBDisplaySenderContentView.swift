@@ -1024,11 +1024,11 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
 
     private var transportDetails: String {
         switch service.language {
-        case .italian: return "Scegli il percorso di rete per questa sessione. Thunderbolt Bridge resta il profilo raccomandato; Network Link e sperimentale."
-        case .english: return "Choose the network path for this session. Thunderbolt Bridge remains the recommended profile; Network Link is experimental."
-        case .german: return "Wähle den Netzwerkpfad für diese Sitzung. Thunderbolt Bridge bleibt die empfohlene Option; Network Link ist experimentell."
-        case .french: return "Choisissez le chemin réseau de cette session. Thunderbolt Bridge reste le profil recommandé ; Network Link est expérimental."
-        case .chinese: return "为该会话选择网络路径。Thunderbolt Bridge 仍然是推荐模式；Network Link 为实验性功能。"
+        case .italian: return "Scegli il percorso di rete per questa sessione. Thunderbolt Bridge resta il profilo raccomandato; Network Link e sperimentale. Direct USB usa un cavo USB-C/USB4 tra i due Mac."
+        case .english: return "Choose the network path for this session. Thunderbolt Bridge remains the recommended profile; Network Link is experimental. Direct USB uses a USB-C/USB4 cable between the two Macs."
+        case .german: return "Wähle den Netzwerkpfad für diese Sitzung. Thunderbolt Bridge bleibt die empfohlene Option; Network Link ist experimentell. Direct USB nutzt ein USB-C/USB4-Kabel zwischen den beiden Macs."
+        case .french: return "Choisissez le chemin réseau de cette session. Thunderbolt Bridge reste le profil recommandé ; Network Link est expérimental. Direct USB utilise un câble USB-C/USB4 entre les deux Mac."
+        case .chinese: return "为该会话选择网络路径。Thunderbolt Bridge 仍然是推荐模式；Network Link 为实验性功能。USB 直连使用两台 Mac 之间的 USB-C/USB4 线缆。"
         }
     }
 

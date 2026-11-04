@@ -23,7 +23,7 @@ targetbridge disconnect
 ```
 
 Options: `--receiver auto|<id|name|ip>`, `--mode mirror|extended`, `--preset <name>`,
-`--path auto|wired|thunderbolt|usb|ethernet|wifi`, `--transport tb|net`, `--session N`,
+`--path auto|wired|thunderbolt|usb|ethernet|wifi`, `--transport tb|usb|net`, `--session N`,
 `--local-ip <ip>`, `--retry`.
 Presets: `standard1080p`, `smooth1080p60`, `standard1440p`, `smooth1440p60`, `smooth1800p60`, `crisp2160p60`, `retina4k60`,
 `native5k`, `native5k60Experimental` (aliases: `1440p`, `1440p60`, `1800p`, `4k`,

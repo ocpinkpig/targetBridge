@@ -350,6 +350,12 @@ final class TBSenderAutomationParsingTests: XCTestCase {
         }
     }
 
+    func testParseTransportUSBAliases() {
+        for alias in ["usb", "USB", "usb4", "USB-C", "usbc", "directusb", "Direct USB", "direct_usb"] {
+            XCTAssertEqual(TBSenderAutomation.parseTransport(alias), .directUSB, "alias \(alias)")
+        }
+    }
+
     /// Documents the current permissive behavior: anything that is not a
     /// network alias — including typos — selects Thunderbolt Bridge.
     func testParseTransportDefaultsToThunderbolt() {

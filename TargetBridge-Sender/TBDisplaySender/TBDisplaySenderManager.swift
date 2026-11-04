@@ -6,6 +6,7 @@ import Network
 
 enum TBTransportKind: String, CaseIterable, Identifiable {
     case thunderboltBridge
+    case directUSB
     case networkLink
 
     var id: String { rawValue }
@@ -17,6 +18,11 @@ enum TBTransportKind: String, CaseIterable, Identifiable {
         case (.thunderboltBridge, .german): return "Thunderbolt Bridge"
         case (.thunderboltBridge, .french): return "Thunderbolt Bridge"
         case (.thunderboltBridge, .chinese): return "Thunderbolt Bridge"
+        case (.directUSB, .italian): return "Direct USB"
+        case (.directUSB, .english): return "Direct USB"
+        case (.directUSB, .german): return "Direct USB"
+        case (.directUSB, .french): return "Direct USB"
+        case (.directUSB, .chinese): return "USB 直连"
         case (.networkLink, .italian): return "Network Link (sperimentale)"
         case (.networkLink, .english): return "Network Link (experimental)"
         case (.networkLink, .german): return "Network Link (experimentell)"
@@ -212,7 +218,7 @@ final class TBDisplaySenderService: ObservableObject {
     var availableTransportKinds: [TBTransportKind] {
         TBTransportKind.allCases.filter { transportKind in
             switch transportKind {
-            case .thunderboltBridge:
+            case .thunderboltBridge, .directUSB:
                 return true
             case .networkLink:
                 return isAddonCapabilityEnabled(.networkLink)
@@ -256,7 +262,9 @@ final class TBDisplaySenderService: ObservableObject {
         let snapshot = TBConfigurationDiagnosticSnapshot(
             hasScreenRecording: CGPreflightScreenCaptureAccess(),
             transportIsThunderbolt: session.transportKind == .thunderboltBridge,
+            transportIsDirectUSB: session.transportKind == .directUSB,
             localInterfaceName: TBConnectionDiagnostics.interfaceName(forLocalIP: session.localInterfaceIP, in: interfaces),
+            localInterfaceIP: session.localInterfaceIP,
             receiverAddress: session.receiverIP.trimmingCharacters(in: .whitespacesAndNewlines),
             receiverProfileAvailable: session.receiverSupportsHEVCDecodeHint != nil,
             receiverSupportsHEVC: session.receiverSupportsHEVCDecodeHint,
@@ -513,6 +521,7 @@ final class TBDisplaySenderService: ObservableObject {
     }
 
     func refreshLocalInterfaces() {
+        TBNetworkInterfaceCache.shared.start()
         localInterfaces = detectLocalInterfaces()
         receiverDiscovery.refresh()
         normalizeSessionInterfaces()
@@ -898,7 +907,7 @@ final class TBDisplaySenderService: ObservableObject {
         let receivers = discoveredReceivers
         let languageCode = language.fileStem
         for receiver in receivers {
-            let candidateIPs = [receiver.preferredIP, receiver.thunderboltIP, receiver.networkIP]
+            let candidateIPs = [receiver.preferredIP, receiver.thunderboltIP, receiver.usbIP, receiver.networkIP]
             var sentTo = Set<String>()
             for ip in candidateIPs where !ip.isEmpty && sentTo.insert(ip).inserted {
                 sendLanguageUpdate(to: ip, languageCode: languageCode)
@@ -962,16 +971,8 @@ final class TBDisplaySenderService: ObservableObject {
                 NI_NUMERICHOST
             ) == 0 else { continue }
             let ip = String(cString: buffer)
-            if name.hasPrefix("bridge"), ip.hasPrefix("169.254.") {
-                interfaces.append(TBLocalLinkInterface(name: name, ip: ip, transportKind: .thunderboltBridge))
-                continue
-            }
-
-            guard isLikelyLocalNetworkInterfaceName(name),
-                  isLikelyLANIPv4(ip)
-            else { continue }
-
-            interfaces.append(TBLocalLinkInterface(name: name, ip: ip, transportKind: .networkLink))
+            guard let transportKind = TBConnectionDiagnostics.transportKind(forInterfaceName: name, ip: ip) else { continue }
+            interfaces.append(TBLocalLinkInterface(name: name, ip: ip, transportKind: transportKind))
         }
 
         return interfaces.sorted {
@@ -983,31 +984,5 @@ final class TBDisplaySenderService: ObservableObject {
             }
             return $0.transportKind.rawValue < $1.transportKind.rawValue
         }
-    }
-
-    private func isLikelyLocalNetworkInterfaceName(_ name: String) -> Bool {
-        if name.hasPrefix("lo") || name.hasPrefix("utun") || name.hasPrefix("awdl") || name.hasPrefix("llw") {
-            return false
-        }
-        return name.hasPrefix("en")
-            || name.hasPrefix("eth")
-            || name.hasPrefix("bridge")
-    }
-
-    private func isLikelyLANIPv4(_ ip: String) -> Bool {
-        if ip.hasPrefix("169.254.") || ip.hasPrefix("127.") {
-            return false
-        }
-        if ip.hasPrefix("10.") || ip.hasPrefix("192.168.") {
-            return true
-        }
-        let components = ip.split(separator: ".")
-        guard components.count == 4,
-              let first = Int(components[0]),
-              let second = Int(components[1])
-        else {
-            return false
-        }
-        return first == 172 && (16...31).contains(second)
     }
 }
