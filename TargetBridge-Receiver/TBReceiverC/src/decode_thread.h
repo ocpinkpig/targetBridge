@@ -6,10 +6,15 @@
  * queue and shows the newest decoded frame (tb_dec_present_latest); the
  * decoding, which must stay in order, happens on this worker.
  *
- * Back-pressure: tb_decode_thread_wants_frames() turns false while a couple
- * of frames are waiting, so the loop stops reading the socket and TCP slows
- * the Sender, which then drops frames before encoding instead of queueing
- * them. */
+ * Pacing: a Sender that honours frame acks (proto.h, 0x39) never has more
+ * than a couple of frames unfinished here, and the loop keeps reading the
+ * socket so cursor and control packets are never stuck behind video.
+ *
+ * For older Senders there is TCP back-pressure instead:
+ * tb_decode_thread_wants_frames() turns false while a couple of frames are
+ * waiting, so the loop stops reading the socket and TCP slows the Sender,
+ * which then drops frames before encoding. That bounds the queue here but
+ * not the frames already sitting in both kernels' socket buffers. */
 
 #ifndef TB_DECODE_THREAD_H
 #define TB_DECODE_THREAD_H
@@ -24,6 +29,9 @@ struct tb_decode_thread;
 
 /* Frames allowed to wait before the loop should stop reading the socket. */
 #define TB_DECODE_QUEUE_TARGET_FRAMES 2
+/* The same for a Sender paced by frame acks, which should never get near
+ * it: only a safety net against one that does not keep its word. */
+#define TB_DECODE_QUEUE_ACKED_LIMIT_FRAMES 8
 /* Hard cap on queued jobs; queueing past it blocks until one finishes. */
 #define TB_DECODE_QUEUE_CAPACITY 32
 
@@ -40,6 +48,9 @@ void tb_decode_thread_reset(struct tb_decode_thread *t);
 
 /* 1 while fewer than TB_DECODE_QUEUE_TARGET_FRAMES frames are waiting. */
 int  tb_decode_thread_wants_frames(struct tb_decode_thread *t);
+
+/* Frames queued and not finished yet, counting the one being decoded. */
+size_t tb_decode_thread_frames_waiting(struct tb_decode_thread *t);
 
 /* Read and reset per-frame decode time (µs). Returns 0 with no samples. */
 int  tb_decode_thread_take_decode_stats(struct tb_decode_thread *t,

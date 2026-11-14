@@ -364,4 +364,97 @@ final class TBMonitorProtocolTests: XCTestCase {
     func testInputEventEncoderParityExtremeValues() {
         assertEncoderParity(makeEvent(kind: "move", dx: Int.min, dy: Int.max))
     }
+
+    // MARK: - Frame acks (receiver-paced video)
+
+    func testFrameAckDecodesTheReceiversJSON() throws {
+        // Exactly what the receiver's snprintf emits (main.c).
+        var buffer = TBMonitorProtocol.makePacket(type: .frameAck, payload: Data(#"{"frames":1234}"#.utf8))
+        let (type, payload) = try XCTUnwrap(try TBMonitorProtocol.drainPacket(from: &buffer))
+        XCTAssertEqual(type, .frameAck)
+        XCTAssertEqual(TBMonitorProtocol.decodeJSON(TBMonitorFrameAck.self, from: payload)?.frames, 1234)
+    }
+
+    func testHelloAnnouncesFrameAcksAndOlderPeersStillDecode() throws {
+        let hello = TBMonitorHelloReceiver(senderName: "Mac", frameAcks: true)
+        let packet = try XCTUnwrap(TBMonitorProtocol.makeJSONPacket(type: .helloReceiver, value: hello))
+        // The receiver looks for this literal text.
+        XCTAssertTrue(String(decoding: packet, as: UTF8.self).contains(#""frameAcks":true"#))
+
+        // A profile from a receiver that predates frame acks.
+        let oldProfile = Data(#"{"receiverName":"iMac","panelWidth":5120,"panelHeight":2880,"modeWidth":2560,"modeHeight":1440,"refreshRate":60,"hiDPI":true,"captureWidth":5120,"captureHeight":2880}"#.utf8)
+        let decoded = try XCTUnwrap(TBMonitorProtocol.decodeJSON(TBMonitorDisplayProfile.self, from: oldProfile))
+        XCTAssertNil(decoded.supportsFrameAcks)
+    }
+
+    func testFrameAckBudgetIsOffUntilTheReceiverSupportsIt() {
+        var budget = TBFrameAckBudget(window: 2)
+        for _ in 0..<50 { budget.noteSent(now: 0) }
+        XCTAssertTrue(budget.hasRoom(inFlight: 5, now: 0), "an older receiver never acks")
+    }
+
+    func testFrameAckBudgetKeepsTwoFramesUnfinished() {
+        var budget = TBFrameAckBudget(window: 2)
+        budget.enable()
+        XCTAssertTrue(budget.hasRoom(inFlight: 0, now: 0))
+        // A frame in the encoder will be sent, so it takes a place already.
+        XCTAssertTrue(budget.hasRoom(inFlight: 1, now: 0))
+        XCTAssertFalse(budget.hasRoom(inFlight: 2, now: 0))
+
+        budget.noteSent(now: 0)
+        XCTAssertTrue(budget.hasRoom(inFlight: 0, now: 0.01))
+        XCTAssertFalse(budget.hasRoom(inFlight: 1, now: 0.01))
+        budget.noteSent(now: 0.01)
+        XCTAssertEqual(budget.unacked, 2)
+        XCTAssertFalse(budget.hasRoom(inFlight: 0, now: 0.02), "one decoding, one waiting: full")
+
+        budget.noteAcked(total: 1, now: 0.03)
+        XCTAssertEqual(budget.unacked, 1)
+        XCTAssertTrue(budget.hasRoom(inFlight: 0, now: 0.03))
+    }
+
+    func testFrameAckBudgetTakesCumulativeAcksInAnyOrder() {
+        var budget = TBFrameAckBudget(window: 2)
+        budget.enable()
+        budget.noteSent(now: 0)
+        budget.noteSent(now: 0)
+        budget.noteAcked(total: 2, now: 0.1)
+        budget.noteAcked(total: 1, now: 0.2)   // late duplicate
+        XCTAssertEqual(budget.unacked, 0)
+        budget.noteAcked(total: 99, now: 0.3)  // more than was ever sent
+        XCTAssertEqual(budget.unacked, 0)
+        budget.noteSent(now: 0.4)
+        XCTAssertEqual(budget.unacked, 1, "an impossible ack must not hide later frames")
+    }
+
+    func testFrameAckBudgetResyncsInsteadOfFreezingWhenAcksStop() {
+        var budget = TBFrameAckBudget(window: 2)
+        budget.enable()
+        budget.noteSent(now: 10)
+        budget.noteSent(now: 10.01)
+        // A slow decode (well under the interval) is waited for.
+        XCTAssertFalse(budget.hasRoom(inFlight: 0, now: 10.5))
+        XCTAssertEqual(budget.resyncs, 0)
+        // Silence past the interval: start over rather than stop the video.
+        XCTAssertTrue(budget.hasRoom(inFlight: 0, now: 10 + TBFrameAckBudget.stallResyncInterval + 0.1))
+        XCTAssertEqual(budget.resyncs, 1)
+        XCTAssertEqual(budget.unacked, 0)
+        // The clock restarts with the next frame, not from the old silence.
+        budget.noteSent(now: 20)
+        budget.noteSent(now: 20)
+        XCTAssertFalse(budget.hasRoom(inFlight: 0, now: 20.5))
+    }
+
+    func testFrameAckWindowIsSharedAcrossThreads() {
+        let window = TBFrameAckWindow(window: 2)
+        window.enable()
+        DispatchQueue.concurrentPerform(iterations: 200) { index in
+            window.noteSent()
+            window.noteAcked(total: UInt64(index))
+            _ = window.hasRoom(inFlight: 0)
+        }
+        let snapshot = window.snapshot
+        XCTAssertEqual(snapshot.sent, 200)
+        XCTAssertLessThanOrEqual(snapshot.acked, snapshot.sent)
+    }
 }

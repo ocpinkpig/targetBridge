@@ -115,11 +115,18 @@ int main(void) {
     reset_log();
     g_decode_ms = 60;
     CHECK(tb_decode_thread_wants_frames(t));
+    CHECK(tb_decode_thread_frames_waiting(t) == 0);
     tb_decode_thread_queue_frame(t, (const uint8_t *)"3", 1);
     tb_decode_thread_queue_frame(t, (const uint8_t *)"4", 1);
     CHECK(!tb_decode_thread_wants_frames(t));
+    /* The frame being decoded still counts: it is not finished (acked). */
+    usleep(20000);
+    CHECK(tb_decode_thread_frames_waiting(t) == 2);
     wait_idle(t, "F3 F4 ");
     CHECK(tb_decode_thread_wants_frames(t));
+    /* The log entry is written just before the frame is counted as done. */
+    for (int i = 0; i < 400 && tb_decode_thread_frames_waiting(t) != 0; i++) usleep(5000);
+    CHECK(tb_decode_thread_frames_waiting(t) == 0);
     CHECK(log_equals("F3 F4 "));
 
     /* Reset drops frames still queued (not the one being decoded), drops
@@ -133,6 +140,8 @@ int main(void) {
     const int drops_before = g_drop_latest_calls;
     tb_decode_thread_reset(t);
     CHECK(g_drop_latest_calls == drops_before + 1);
+    /* 6 and 7 are finished with (acked as discarded); 5 is still decoding. */
+    CHECK(tb_decode_thread_frames_waiting(t) == 1);
     wait_idle(t, "F5 R ");
     CHECK(log_equals("F5 R "));
     CHECK(tb_decode_thread_wants_frames(t));  /* back-pressure count recovered */
