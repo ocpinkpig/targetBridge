@@ -66,78 +66,53 @@ final class TBSenderAutomationParsingTests: XCTestCase {
         )
     }
 
-    func testReceiverControlUsesLowLatencyCursorOverlayByDefault() {
-        // receiverMaster: the Receiver draws the cursor itself so it does not
-        // trail the Receiver's mouse by the video round trip.
-        XCTAssertTrue(
-            TBInputControlRole.receiverMaster.usesLowLatencyCursorOverlay(
-                largeCursorEnabled: false, lowLatencyCursorEnabled: true
+    func testLowLatencyCursorOverlayIsUsedInEveryRoleByDefault() {
+        // The Receiver draws the cursor itself so it does not move at the
+        // video's pace: that holds for the Sender's own mouse on the
+        // extended desktop (off, senderMaster) as much as for the Receiver's.
+        for role in TBInputControlRole.allCases {
+            XCTAssertTrue(
+                role.usesLowLatencyCursorOverlay(
+                    largeCursorEnabled: false, lowLatencyCursorEnabled: true
+                ),
+                "\(role)"
             )
-        )
-        // Opting out restores the native (video) cursor with every shape.
-        XCTAssertFalse(
-            TBInputControlRole.receiverMaster.usesLowLatencyCursorOverlay(
-                largeCursorEnabled: false, lowLatencyCursorEnabled: false
+            // Opting out restores the native (video) cursor with every shape.
+            XCTAssertFalse(
+                role.usesLowLatencyCursorOverlay(
+                    largeCursorEnabled: false, lowLatencyCursorEnabled: false
+                ),
+                "\(role)"
             )
-        )
-        // The setting only affects receiverMaster.
-        XCTAssertFalse(
-            TBInputControlRole.senderMaster.usesLowLatencyCursorOverlay(
-                largeCursorEnabled: false, lowLatencyCursorEnabled: true
+            // The large cursor always needs the overlay.
+            XCTAssertTrue(
+                role.usesLowLatencyCursorOverlay(
+                    largeCursorEnabled: true, lowLatencyCursorEnabled: false
+                ),
+                "\(role)"
             )
-        )
-        XCTAssertFalse(
-            TBInputControlRole.off.usesLowLatencyCursorOverlay(
-                largeCursorEnabled: false, lowLatencyCursorEnabled: true
-            )
-        )
-        // The large cursor always needs the overlay.
-        XCTAssertTrue(
-            TBInputControlRole.off.usesLowLatencyCursorOverlay(
-                largeCursorEnabled: true, lowLatencyCursorEnabled: false
-            )
-        )
+        }
     }
 
-    func testCursorCaptureModeChangesWhenEnteringOrLeavingReceiverControl() {
-        // Switching role must restart capture so the video stops (or starts)
-        // carrying the cursor; otherwise the Receiver shows two cursors.
-        XCTAssertTrue(
-            TBInputControlRole.receiverMaster.changesCursorCaptureMode(
-                from: .off, largeCursorEnabled: false, lowLatencyCursorEnabled: true
-            )
-        )
-        XCTAssertTrue(
-            TBInputControlRole.off.changesCursorCaptureMode(
-                from: .receiverMaster, largeCursorEnabled: false, lowLatencyCursorEnabled: true
-            )
-        )
-        XCTAssertFalse(
-            TBInputControlRole.senderMaster.changesCursorCaptureMode(
-                from: .off, largeCursorEnabled: false, lowLatencyCursorEnabled: true
-            )
-        )
-        XCTAssertFalse(
-            TBInputControlRole.receiverMaster.changesCursorCaptureMode(
-                from: .off, largeCursorEnabled: false, lowLatencyCursorEnabled: false
-            )
-        )
-        XCTAssertFalse(
-            TBInputControlRole.receiverMaster.changesCursorCaptureMode(
-                from: .off, largeCursorEnabled: true, lowLatencyCursorEnabled: true
-            )
-        )
-        // receiverMaster ↔ senderMaster also flips the video cursor.
-        XCTAssertTrue(
-            TBInputControlRole.senderMaster.changesCursorCaptureMode(
-                from: .receiverMaster, largeCursorEnabled: false, lowLatencyCursorEnabled: true
-            )
-        )
-        XCTAssertTrue(
-            TBInputControlRole.receiverMaster.changesCursorCaptureMode(
-                from: .senderMaster, largeCursorEnabled: false, lowLatencyCursorEnabled: true
-            )
-        )
+    func testChangingRoleKeepsTheCursorCaptureMode() {
+        // Every role captures the cursor the same way, so a role change must
+        // not restart capture (a restart blanks the stream for a moment).
+        for previous in TBInputControlRole.allCases {
+            for next in TBInputControlRole.allCases {
+                for large in [false, true] {
+                    for lowLatency in [false, true] {
+                        XCTAssertFalse(
+                            next.changesCursorCaptureMode(
+                                from: previous,
+                                largeCursorEnabled: large,
+                                lowLatencyCursorEnabled: lowLatency
+                            ),
+                            "\(previous) -> \(next) large=\(large) lowLatency=\(lowLatency)"
+                        )
+                    }
+                }
+            }
+        }
     }
 
     private func cursorPacket(visible: Bool) -> TBMonitorCursor {

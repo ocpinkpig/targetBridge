@@ -29,6 +29,12 @@
  * type 0x35 = brightness update (JSON)
  * type 0x36 = clipboard update (JSON)
  * type 0x37 = volume update (JSON)
+ * type 0x39 = video frame ack, receiver -> sender (JSON {"frames":N})
+ *   N = video frames (0x21/0x22) this receiver has finished with since the
+ *   connection opened: decoded, shown raw, or discarded. A sender that put
+ *   "frameAcks":true in its hello gets these and keeps only a couple of
+ *   frames unacknowledged, so video is paced by the decoder itself instead
+ *   of by full TCP buffers.
  *
  * Compatible with the new TBDisplaySender Swift app.
  */
@@ -59,6 +65,7 @@
  * Both are private CoreBrightness features, so the receiver reports whether it
  * can honour them in its display profile. */
 #define TB_PKT_DISPLAY_TWEAKS   0x38
+#define TB_PKT_FRAME_ACK        0x39
 #define TB_PKT_TEST_DATA        0x40
 
 #define TB_HDR_BYTES        5   /* 4 length + 1 type */

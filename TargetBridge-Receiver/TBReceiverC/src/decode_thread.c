@@ -192,12 +192,16 @@ void tb_decode_thread_reset(struct tb_decode_thread *t) {
     tb_decode_thread_push(t, TB_DECODE_JOB_RESET, NULL, 0);
 }
 
-int tb_decode_thread_wants_frames(struct tb_decode_thread *t) {
-    if (!t) return 1;
+size_t tb_decode_thread_frames_waiting(struct tb_decode_thread *t) {
+    if (!t) return 0;
     pthread_mutex_lock(&t->lock);
-    const int wants = t->frames_waiting < TB_DECODE_QUEUE_TARGET_FRAMES;
+    const size_t waiting = t->frames_waiting;
     pthread_mutex_unlock(&t->lock);
-    return wants;
+    return waiting;
+}
+
+int tb_decode_thread_wants_frames(struct tb_decode_thread *t) {
+    return tb_decode_thread_frames_waiting(t) < TB_DECODE_QUEUE_TARGET_FRAMES;
 }
 
 int tb_decode_thread_take_decode_stats(struct tb_decode_thread *t,

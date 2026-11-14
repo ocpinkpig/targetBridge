@@ -19,6 +19,8 @@ enum TBMonitorPacketType: UInt8 {
     case volume = 0x37
     /// Night Shift / True Tone on the receiver's panel.
     case displayTweaks = 0x38
+    /// Receiver → Sender: how many video frames it has finished with.
+    case frameAck = 0x39
     case testData = 0x40
 }
 
@@ -30,6 +32,9 @@ struct TBMonitorHelloReceiver: Codable {
     var captureWidth: Int?
     var captureHeight: Int?
     var codec: String?
+    /// This Sender paces video by `frameAck` packets, so the Receiver should
+    /// send them and need not hold back socket reads to slow it down.
+    var frameAcks: Bool? = nil
 }
 
 struct TBMonitorDisplayProfile: Codable {
@@ -49,6 +54,8 @@ struct TBMonitorDisplayProfile: Codable {
     /// Optional so older receivers still decode; absent means "cannot".
     var supportsNightShift: Bool?
     var supportsTrueTone: Bool?
+    /// The Receiver acknowledges finished video frames (`frameAck`).
+    var supportsFrameAcks: Bool?
 }
 
 struct TBMonitorCreateSessionAck: Codable {
@@ -122,6 +129,12 @@ struct TBMonitorDisplayTweaks: Codable {
 
 struct TBMonitorClipboard: Codable {
     var text: String
+}
+
+/// Video frames (`frame` and `rawFrame`) the Receiver has finished with since
+/// the connection opened: decoded, shown raw, or discarded.
+struct TBMonitorFrameAck: Codable {
+    var frames: UInt64
 }
 
 /// Framing-level corruption that cannot be recovered by waiting for more

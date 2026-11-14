@@ -43,6 +43,7 @@ Python 3) speaks the full wire protocol against a running receiver:
 |-------------|----------------------------------------------------------------|
 | `handshake` | HELLO / heartbeat / TEARDOWN lifecycle                          |
 | `stream`    | PARAM_SETS + AVCC H.264 frames (generated via the ffmpeg CLI)   |
+| `pace`      | a sender faster than the decoder, plus a 120 Hz overlay cursor: frame-ack pacing (default) or TCP only (`--no-acks`) |
 | `hang`      | idle watchdog: silent sender is reaped after ~10s               |
 | `badlen`    | parser rejects a corrupt `0xFFFFFFFF` length and disconnects    |
 | `drop`      | abrupt mid-packet disconnect returns receiver to waiting        |
@@ -53,6 +54,18 @@ cd TargetBridge-Receiver/TBReceiverC && make && ./tbreceiver --windowed
 
 # terminal 2
 python3 TargetBridge-Receiver/TBReceiverC/tests/mock_sender.py --mode stream --duration 5
+```
+
+To see what frame acks are for, make the receiver the slow side
+(`TB_RECEIVER_DECODE_DELAY_MS=30 ./tbreceiver --windowed`) and run `pace`
+both ways. The mock prints how long the receiver needed to catch up after
+the last frame, and the receiver's `[latency] rtt` line shows how late each
+cursor packet was handled: about a millisecond with acks, growing by the
+second with `--no-acks`.
+
+```bash
+python3 TargetBridge-Receiver/TBReceiverC/tests/mock_sender.py --mode pace --duration 8
+python3 TargetBridge-Receiver/TBReceiverC/tests/mock_sender.py --mode pace --duration 8 --no-acks
 ```
 
 ## 4. Loopback smoke test (one command)

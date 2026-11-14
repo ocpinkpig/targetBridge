@@ -252,6 +252,15 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         return 3
     }
 
+    /// Frames the Receiver may have unfinished at once (see
+    /// `TBFrameAckBudget`): one decoding and one waiting.
+    var maxUnackedFrames: Int {
+        if let envVal = ProcessInfo.processInfo.environment["MUAF"], let parsed = Int(envVal) {
+            return parsed
+        }
+        return 2
+    }
+
     var maxFrameDelayCount: Int {
         switch self {
         case .standard1080p, .standard1440p:
@@ -387,6 +396,99 @@ struct TBFrameRatePacer {
     }
 }
 
+/// Paces video by what the Receiver has actually finished, not by what TCP
+/// will take.
+///
+/// TCP back-pressure alone lets megabytes of video sit in the two kernels'
+/// socket buffers before the Sender notices. Frames in which only the cursor
+/// moved are a few kilobytes, so that was dozens of frames: on a Receiver
+/// that decodes slower than the Sender captures (5K on an Intel iMac, ~30
+/// fps) the picture, and the cursor in it, fell further behind the longer
+/// the mouse kept moving and "drifted" on after it stopped. Cursor-overlay
+/// packets queued behind the same backlog.
+///
+/// The Receiver reports how many frames it has finished (`frameAck`), and
+/// the Sender starts another only while fewer than `window` are unfinished:
+/// one being decoded and one waiting keeps the decoder busy without a queue.
+struct TBFrameAckBudget {
+    /// With the window full and no ack for this long, assume the counts
+    /// disagree and start over rather than freeze the picture.
+    static let stallResyncInterval: TimeInterval = 1.0
+
+    let window: Int
+    /// Off until the Receiver's profile says it sends acks (older Receivers).
+    private(set) var isEnabled = false
+    private(set) var sent: UInt64 = 0
+    private(set) var acked: UInt64 = 0
+    private(set) var resyncs = 0
+    private var lastProgress: TimeInterval = 0
+
+    init(window: Int) {
+        self.window = min(64, max(1, window))
+    }
+
+    /// Frames sent that the Receiver has not finished yet.
+    var unacked: Int {
+        Int(min(sent - min(acked, sent), 1 << 20))
+    }
+
+    mutating func enable() {
+        isEnabled = true
+    }
+
+    mutating func noteSent(now: TimeInterval) {
+        if unacked == 0 { lastProgress = now }
+        sent += 1
+    }
+
+    /// `total` is cumulative for the connection, so a late or repeated ack
+    /// is harmless.
+    mutating func noteAcked(total: UInt64, now: TimeInterval) {
+        let total = min(total, sent)
+        guard total > acked else { return }
+        acked = total
+        lastProgress = now
+    }
+
+    /// Whether one more frame may be started. `inFlight` counts frames in
+    /// the encoder, which will be sent and cannot be dropped any more.
+    mutating func hasRoom(inFlight: Int, now: TimeInterval) -> Bool {
+        guard isEnabled else { return true }
+        let encoding = max(0, inFlight)
+        if unacked + encoding < window { return true }
+        guard unacked > 0, now - lastProgress > Self.stallResyncInterval else { return false }
+        acked = sent
+        lastProgress = now
+        resyncs += 1
+        return encoding < window
+    }
+}
+
+/// One connection's `TBFrameAckBudget`, shared by the video pipeline (its own
+/// queue) and the packet handler (main actor). It outlives a pipeline, since
+/// a capture restart keeps the connection and the Receiver keeps counting.
+final class TBFrameAckWindow: @unchecked Sendable {
+    private let lock = NSLock()
+    private var budget: TBFrameAckBudget
+
+    init(window: Int) {
+        budget = TBFrameAckBudget(window: window)
+    }
+
+    private func withBudget<T>(_ body: (inout TBFrameAckBudget) -> T) -> T {
+        lock.lock(); defer { lock.unlock() }
+        return body(&budget)
+    }
+
+    private var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
+
+    func enable() { withBudget { $0.enable() } }
+    func noteSent() { let now = now; withBudget { $0.noteSent(now: now) } }
+    func noteAcked(total: UInt64) { let now = now; withBudget { $0.noteAcked(total: total, now: now) } }
+    func hasRoom(inFlight: Int) -> Bool { let now = now; return withBudget { $0.hasRoom(inFlight: inFlight, now: now) } }
+    var snapshot: TBFrameAckBudget { withBudget { $0 } }
+}
+
 enum TBDisplayCodecPreference: String, CaseIterable, Identifiable, Codable {
     case automatic
     case h264
@@ -437,16 +539,22 @@ enum TBInputControlRole: String, CaseIterable, Identifiable {
     ///
     /// The video cursor keeps every native macOS shape (e.g. the screenshot
     /// crosshair) but arrives only after capture → encode → network → decode,
-    /// which on a 5K stream is long enough that a cursor driven from the
-    /// Receiver's own mouse visibly trails the hand. So receiverMaster uses
-    /// the overlay unless the user opts out; the large cursor always does.
+    /// and moves no more often than the Receiver can decode: on a 5K stream
+    /// to an Intel iMac that is ~30 times a second, 60 ms or more late, in
+    /// every role — the Sender's own mouse on the extended desktop trails
+    /// just like the Receiver's. Moving it also costs a full video frame
+    /// each time. So the overlay is used in every role unless the user opts
+    /// out; the large cursor always uses it.
     func usesLowLatencyCursorOverlay(
         largeCursorEnabled: Bool,
         lowLatencyCursorEnabled: Bool
     ) -> Bool {
-        largeCursorEnabled || (self == .receiverMaster && lowLatencyCursorEnabled)
+        largeCursorEnabled || lowLatencyCursorEnabled
     }
 
+    /// Whether moving to this role changes how the cursor is captured, which
+    /// needs a capture restart. No role differs today; the callers stay so a
+    /// role-specific rule only has to change the function above.
     func changesCursorCaptureMode(
         from previousRole: TBInputControlRole,
         largeCursorEnabled: Bool,
@@ -547,6 +655,10 @@ private final class TBDirectDisplayStreamCapture {
 /// state is confined to `queue`; the two values the main thread polls
 /// (`sentFrames`, capture health) are guarded by a small lock instead of
 /// a per-frame hop back to main.
+///
+/// One exception: the Receiver's frame acks are read on the main actor with
+/// the other inbound packets, so a blocked main thread holds video at the
+/// ack window until it runs again (`TBFrameAckBudget` restarts after 1 s).
 private final class TBVideoPipeline: @unchecked Sendable {
     let queue = DispatchQueue(label: "fd.tbmonitor.sender.pipeline", qos: .userInteractive)
 
@@ -556,10 +668,16 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private let displayName: String
     private let displayID: CGDirectDisplayID
     private let usesRawNV12: Bool
+    private let ackWindow: TBFrameAckWindow
     private let onFirstFrame: @Sendable () -> Void
 
     // Confined to `queue`.
     private var vtEncoder: VTCompressionSession?
+    /// The newest captured frame there was no room to send. If the screen
+    /// then stops changing, no further frame arrives, so this one must still
+    /// go out once there is room or the Receiver would be left showing an
+    /// older picture. A newer capture replaces it.
+    private var heldFrame: (pixelBuffer: CVPixelBuffer, pts: CMTime)?
     private var vtEncoderRef: Unmanaged<TBVideoPipeline>?
     private var pendingVideoPackets = 0
     private var inFlightEncodeFrames = 0
@@ -584,6 +702,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
          displayName: String,
          displayID: CGDirectDisplayID,
          usesRawNV12: Bool,
+         ackWindow: TBFrameAckWindow,
          ackAlreadySent: Bool,
          onFirstFrame: @escaping @Sendable () -> Void) {
         self.preset = preset
@@ -592,6 +711,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         self.displayName = displayName
         self.displayID = displayID
         self.usesRawNV12 = usesRawNV12
+        self.ackWindow = ackWindow
         self.frameRatePacer = TBFrameRatePacer(maximumFrameRate: preset.expectedFrameRate)
         self.ackSent = ackAlreadySent
         self.onFirstFrame = onFirstFrame
@@ -619,6 +739,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
     func stop() {
         queue.sync {
             running = false
+            heldFrame = nil
             if let encoder = vtEncoder { VTCompressionSessionInvalidate(encoder) }
             vtEncoder = nil
             vtEncoderRef?.release()
@@ -684,8 +805,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
             let pipeline = Unmanaged<TBVideoPipeline>.fromOpaque(ref).takeUnretainedValue()
             pipeline.queue.async {
                 pipeline.inFlightEncodeFrames = max(0, pipeline.inFlightEncodeFrames - 1)
-                guard status == noErr, let sampleBuffer else { return }
-                pipeline.handleEncoded(sampleBuffer)
+                if status == noErr, let sampleBuffer {
+                    pipeline.handleEncoded(sampleBuffer)
+                }
+                pipeline.sendHeldFrameIfPossible()
             }
         }
 
@@ -744,18 +867,74 @@ private final class TBVideoPipeline: @unchecked Sendable {
             return
         }
         if usesRawNV12 {
-            sendRawFrame(sampleBuffer)
+            // Backpressure: never pile frames on top of a network or a
+            // Receiver that can't keep up.
+            if pendingVideoPackets >= preset.maxPendingVideoPackets || !receiverHasRoom() {
+                hold(pixelBuffer, presentationTimeStamp: pts)
+                return
+            }
+            supersedeHeldFrame()
+            sendRawFrame(pixelBuffer)
             return
         }
         guard let encoder = vtEncoder else { return }
         if !TBVideoQueueBudget.canEncode(pending: pendingVideoPackets,
                                         inFlight: inFlightEncodeFrames,
                                         packetLimit: preset.maxPendingVideoPackets,
-                                        encodeLimit: preset.maxInFlightEncodeFrames) {
-            droppedBeforeEncodeFrames += 1
+                                        encodeLimit: preset.maxInFlightEncodeFrames) ||
+            !receiverHasRoom() {
+            hold(pixelBuffer, presentationTimeStamp: pts)
             return
         }
+        supersedeHeldFrame()
         encode(pixelBuffer: pixelBuffer, presentationTimeStamp: pts, using: encoder)
+    }
+
+    // MARK: - Receiver pacing and the held frame (on `queue`)
+
+    private func receiverHasRoom() -> Bool {
+        ackWindow.hasRoom(inFlight: inFlightEncodeFrames)
+    }
+
+    /// Keeps `pixelBuffer` as the frame to send once there is room, in place
+    /// of any older one, which is now dropped for good.
+    private func hold(_ pixelBuffer: CVPixelBuffer, presentationTimeStamp pts: CMTime) {
+        if heldFrame != nil { droppedBeforeEncodeFrames += 1 }
+        heldFrame = (pixelBuffer, pts)
+    }
+
+    /// A newer frame is going out, so a held one is out of date.
+    private func supersedeHeldFrame() {
+        guard heldFrame != nil else { return }
+        heldFrame = nil
+        droppedBeforeEncodeFrames += 1
+    }
+
+    /// Sends the held frame if there is room now. Called whenever room may
+    /// have appeared: a frame ack, a finished send, a finished encode.
+    private func sendHeldFrameIfPossible() {
+        guard running, let held = heldFrame else { return }
+        if usesRawNV12 {
+            guard pendingVideoPackets < preset.maxPendingVideoPackets, receiverHasRoom() else { return }
+            heldFrame = nil
+            sendRawFrame(held.pixelBuffer)
+            return
+        }
+        guard let encoder = vtEncoder,
+              TBVideoQueueBudget.canEncode(pending: pendingVideoPackets,
+                                           inFlight: inFlightEncodeFrames,
+                                           packetLimit: preset.maxPendingVideoPackets,
+                                           encodeLimit: preset.maxInFlightEncodeFrames),
+              receiverHasRoom() else { return }
+        heldFrame = nil
+        encode(pixelBuffer: held.pixelBuffer, presentationTimeStamp: held.pts, using: encoder)
+    }
+
+    /// The Receiver finished a frame (the count is already in `ackWindow`).
+    func receiverFinishedFrames() {
+        queue.async { [weak self] in
+            self?.sendHeldFrameIfPossible()
+        }
     }
 
     /// CGDisplayStream capture path. Delivered directly on `queue` by
@@ -773,13 +952,6 @@ private final class TBVideoPipeline: @unchecked Sendable {
         }
         guard frameRatePacer.shouldEmit(presentationTime: pts) else {
             droppedByFrameRatePacer += 1
-            return
-        }
-        if !TBVideoQueueBudget.canEncode(pending: pendingVideoPackets,
-                                        inFlight: inFlightEncodeFrames,
-                                        packetLimit: preset.maxPendingVideoPackets,
-                                        encodeLimit: preset.maxInFlightEncodeFrames) {
-            droppedBeforeEncodeFrames += 1
             return
         }
 
@@ -800,13 +972,22 @@ private final class TBVideoPipeline: @unchecked Sendable {
         }
         let pixelBuffer = unmanagedPixelBuffer.takeRetainedValue()
 
-        displayStreamFrameSequence += 1
         // Derive PTS from the frame's actual capture time. CGDisplayStream
         // delivers frames irregularly (event-driven on screen changes), so a
         // frame-counter PTS would drift away from real wall-clock time over a
         // long session and pace the receiver progressively wrong. displayTime is
         // in mach-absolute units, the same host clock the SCStream path uses.
         lastEncodedDisplayPTS = pts
+        if !TBVideoQueueBudget.canEncode(pending: pendingVideoPackets,
+                                        inFlight: inFlightEncodeFrames,
+                                        packetLimit: preset.maxPendingVideoPackets,
+                                        encodeLimit: preset.maxInFlightEncodeFrames) ||
+            !receiverHasRoom() {
+            hold(pixelBuffer, presentationTimeStamp: pts)
+            return
+        }
+        supersedeHeldFrame()
+        displayStreamFrameSequence += 1
         encode(pixelBuffer: pixelBuffer, presentationTimeStamp: pts, using: encoder)
     }
 
@@ -857,10 +1038,12 @@ private final class TBVideoPipeline: @unchecked Sendable {
 
         if let packet = buildFramePacket(from: sampleBuffer) {
             pendingVideoPackets += 1
+            ackWindow.noteSent()
             connection.send(content: packet, completion: .contentProcessed({ [weak self] _ in
                 guard let self else { return }
                 self.queue.async {
                     self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
+                    self.sendHeldFrameIfPossible()
                 }
             }))
             lock.lock(); _sentFrames += 1; lock.unlock()
@@ -871,15 +1054,9 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// and send them uncompressed. The receiver blits them directly (no decode).
     /// Payload: [1: format=1(NV12)][BE32 w][BE32 h][BE32 yStride][BE32 uvStride]
     ///          [Y plane: yStride*h][CbCr plane: uvStride*(h/2)]
-    private func sendRawFrame(_ sampleBuffer: CMSampleBuffer) {
-        guard running,
-              let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
-        else { return }
-        // Backpressure: never pile frames on top of a network that can't keep up.
-        if pendingVideoPackets >= preset.maxPendingVideoPackets {
-            droppedBeforeEncodeFrames += 1
-            return
-        }
+    private func sendRawFrame(_ pixelBuffer: CVPixelBuffer) {
+        guard running else { return }
+        // The caller has already checked there is room for this frame.
         guard CVPixelBufferGetPlaneCount(pixelBuffer) >= 2 else { return }
 
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
@@ -921,10 +1098,12 @@ private final class TBVideoPipeline: @unchecked Sendable {
 
         let packet = TBMonitorProtocol.makePacket(type: .rawFrame, payload: payload)
         pendingVideoPackets += 1
+        ackWindow.noteSent()
         connection.send(content: packet, completion: .contentProcessed({ [weak self] _ in
             guard let self else { return }
             self.queue.async {
                 self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
+                self.sendHeldFrameIfPossible()
             }
         }))
         lock.lock(); _sentFrames += 1; lock.unlock()
@@ -1365,6 +1544,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private var scStream: SCStream?
     private var directDisplayStream: TBDirectDisplayStreamCapture?
     private var pipeline: TBVideoPipeline?
+    /// Receiver-paced video for the current connection (see `TBFrameAckBudget`).
+    private var frameAckWindow: TBFrameAckWindow?
 
     private var sentSnapshot = 0
     private var sessionAckSent = false
@@ -1691,6 +1872,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             using: params
         )
         connection = conn
+        // The Receiver counts acked frames per connection; so does this.
+        frameAckWindow = TBFrameAckWindow(window: capturePreset.maxUnackedFrames)
 
         conn.stateUpdateHandler = { [weak self, weak conn] state in
             Task { @MainActor [weak self, weak conn] in
@@ -2090,7 +2273,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 captureSource: captureSource.title(language),
                 captureWidth: preset.width,
                 captureHeight: preset.height,
-                codec: codecName(for: helloCodecType)
+                codec: codecName(for: helloCodecType),
+                frameAcks: true
             )
         ) else { return }
         send(packet)
@@ -2259,6 +2443,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 }
             case .heartbeat:
                 break
+            case .frameAck:
+                if let ack = TBMonitorProtocol.decodeJSON(TBMonitorFrameAck.self, from: payload) {
+                    frameAckWindow?.noteAcked(total: ack.frames)
+                    pipeline?.receiverFinishedFrames()
+                }
             case .teardown:
                 setStatus(.receiverTerminatedSession)
                 stop(resetStatusTo: nil)
@@ -2661,6 +2850,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
         receiverSupportsNightShift = profile.supportsNightShift ?? false
         receiverSupportsTrueTone = profile.supportsTrueTone ?? false
+        if profile.supportsFrameAcks == true {
+            frameAckWindow?.enable()
+        }
+        TBLog.connection.info("receiver profile: video pacing=\(profile.supportsFrameAcks == true ? "frame acks" : "TCP back-pressure (older receiver)", privacy: .public)")
         receiverPanelText = TBDisplaySenderL10n.receiverSummary(profile, language: language)
         sendHello()
         sendInputControlModeUpdate()
@@ -2828,7 +3021,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     "capture: codec fallback preference=\(self.codecPreference.rawValue, privacy: .public) selected=\(codecName, privacy: .public)"
                 )
             }
-            guard let connection else { return false }
+            guard let connection, let frameAckWindow else { return false }
 
             // The encode/send pipeline runs entirely on its own serial queue,
             // off the main thread, so SwiftUI layout can never stall frame
@@ -2841,6 +3034,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 displayName: session.displayName,
                 displayID: session.displayID,
                 usesRawNV12: usesRawNV12,
+                ackWindow: frameAckWindow,
                 ackAlreadySent: sessionAckSent,
                 onFirstFrame: { [weak self] in
                     Task { @MainActor in self?.handleFirstEncodedFrame() }
@@ -3783,8 +3977,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             droppedPre: 0,
             droppedPost: 0
         )
+        // unacked = frames the Receiver has not finished (at most its window
+        // while it sends frame acks); ackResyncs should stay 0.
+        let acks = frameAckWindow?.snapshot
         NSLog(
-            "TargetBridge: stream snapshot streaming=%@ fps=%d virtualID=%u online=%@ pendingPackets=%d inFlightEncode=%d ptsSeq=%lld captured=%d droppedPacing=%d droppedPre=%d droppedPost=%d",
+            "TargetBridge: stream snapshot streaming=%@ fps=%d virtualID=%u online=%@ pendingPackets=%d inFlightEncode=%d ptsSeq=%lld captured=%d droppedPacing=%d droppedPre=%d droppedPost=%d frameAcks=%@ unacked=%d ackResyncs=%d",
             isStreaming ? "yes" : "no",
             liveMetrics.senderFPS,
             session.displayID,
@@ -3795,7 +3992,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             diag.captured,
             diag.droppedPacing,
             diag.droppedPre,
-            diag.droppedPost
+            diag.droppedPost,
+            acks?.isEnabled == true ? "yes" : "no",
+            acks?.unacked ?? 0,
+            acks?.resyncs ?? 0
         )
     }
 

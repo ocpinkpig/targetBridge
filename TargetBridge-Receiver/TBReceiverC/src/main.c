@@ -41,7 +41,9 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -140,6 +142,17 @@ struct app {
     uint64_t last_loop_us;
     /* Socket reads skipped because the decoder was behind (back-pressure). */
     uint64_t throttled_reads;
+    /* Frame acks (proto.h, 0x39). The Sender asked for them in its hello and
+     * keeps only a couple of frames unacknowledged, so the socket is read
+     * without back-pressure and nothing waits behind unread video. */
+    int      sender_frame_acks;
+    uint64_t video_frames_received;   /* this connection, 0x21 and 0x22 */
+    uint64_t video_frames_acked;      /* last count sent to the Sender */
+    uint64_t max_frames_waiting;      /* worst decode queue this second */
+    /* Time between the Sender's cursor packets while the cursor moves: how
+     * evenly the overlay cursor is being fed (see the [cursor] line). */
+    struct tb_timing_stats cursor_interval_us;
+    uint64_t last_cursor_packet_us;
     struct tb_timing_stats input_wait_us;
     struct tb_timing_stats predict_error_tenths_pt;
     uint64_t last_latency_report_ms;
@@ -441,12 +454,53 @@ static void tb_receiver_apply_language_preference(struct app *a) {
     tb_receiver_refresh_permissions_text(a);
 }
 
+/* Input Monitoring / Accessibility state, kept current by a background
+ * thread and only read here.
+ *
+ * Each check is a synchronous round trip to tccd. While the permission is
+ * granted it returns at once, but while it is not (for example the receiver
+ * was started from a terminal app that does not hold it) every check took
+ * 30-50 ms on the Intel iMac. Polled on the event loop four times a second,
+ * that froze the picture and the cursor for that long each time. */
+static atomic_int g_input_monitoring_trusted = -1;
+static atomic_int g_accessibility_trusted = -1;
+
+static void tb_receiver_refresh_permission_cache(void) {
+    atomic_store(&g_input_monitoring_trusted, CGPreflightListenEventAccess() ? 1 : 0);
+    atomic_store(&g_accessibility_trusted, AXIsProcessTrusted() ? 1 : 0);
+}
+
+static void *tb_receiver_permission_thread_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        usleep(250000);
+        tb_receiver_refresh_permission_cache();
+    }
+    return NULL;
+}
+
+/* Reads the state once here, then keeps it current off this thread. */
+static void tb_receiver_start_permission_watch(void) {
+    tb_receiver_refresh_permission_cache();
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, tb_receiver_permission_thread_main, NULL) == 0) {
+        pthread_detach(thread);
+    } else {
+        /* Fall back to asking directly (slow while a permission is missing). */
+        atomic_store(&g_input_monitoring_trusted, -1);
+        atomic_store(&g_accessibility_trusted, -1);
+        fprintf(stderr, "[input] could not start the permission watch thread\n");
+    }
+}
+
 static int tb_receiver_input_monitoring_trusted(void) {
-    return CGPreflightListenEventAccess() ? 1 : 0;
+    const int cached = atomic_load(&g_input_monitoring_trusted);
+    return cached >= 0 ? cached : (CGPreflightListenEventAccess() ? 1 : 0);
 }
 
 static int tb_receiver_accessibility_trusted(void) {
-    return AXIsProcessTrusted() ? 1 : 0;
+    const int cached = atomic_load(&g_accessibility_trusted);
+    return cached >= 0 ? cached : (AXIsProcessTrusted() ? 1 : 0);
 }
 
 static void tb_receiver_cycle_language_preference(struct app *a) {
@@ -1221,6 +1275,15 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
 
             tb_set_receiver_mode_requested(a->mode_text, sizeof(a->mode_text), capture_w, capture_h, source, preset, codec);
         }
+        {
+            int frame_acks = 0;
+            (void)extract_json_bool_field(payload, len, "\"frameAcks\"", &frame_acks);
+            if (frame_acks != a->sender_frame_acks) {
+                a->sender_frame_acks = frame_acks;
+                fprintf(stderr, "[main] video pacing: %s\n",
+                        frame_acks ? "frame acks" : "TCP back-pressure (older sender)");
+            }
+        }
         a->session_active = 1;
         fprintf(stderr, "[main] hello from sender\n");
         tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.sender_connected_profile_sent");
@@ -1241,12 +1304,14 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
         /* Decoded on the decode thread; the loop shows the newest result
          * (tb_dec_present_latest) so decoding never blocks input. */
         a->session_active = 1;
+        a->video_frames_received++;
         tb_decode_thread_queue_frame(a->decode_thread, payload, len);
         break;
     case TB_PKT_RAW_FRAME:
         /* Uncompressed frames point into the packet buffer, so they are shown
          * immediately rather than deferred like decoded ones. */
         a->session_active = 1;
+        a->video_frames_received++;
         handle_raw_frame(a, payload, len);
         break;
     case TB_PKT_CURSOR:
@@ -1271,9 +1336,15 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
             (void)extract_json_double_field(payload, len, "\"pointWidth\"", &point_w);
             (void)extract_json_double_field(payload, len, "\"pointHeight\"", &point_h);
             if (!extract_json_double_field(payload, len, "\"echo\"", &echo) || echo < 0) echo = 0;
+            const uint64_t cursor_now_us = now_us();
             if (echo > 0) {
-                tb_timing_stats_add_elapsed(&a->cursor_rtt_us, (uint64_t)echo, now_us());
+                tb_timing_stats_add_elapsed(&a->cursor_rtt_us, (uint64_t)echo, cursor_now_us);
             }
+            /* Gaps over 200 ms are the cursor resting, not packets held up. */
+            if (a->last_cursor_packet_us && cursor_now_us - a->last_cursor_packet_us < 200000) {
+                tb_timing_stats_add_elapsed(&a->cursor_interval_us, a->last_cursor_packet_us, cursor_now_us);
+            }
+            a->last_cursor_packet_us = cursor_now_us;
             uint64_t error_tenths_pt = 0;
             if (tb_cursor_predictor_on_cursor(&a->cursor_predictor, x, y, w, h, visible,
                                               point_w, point_h, (uint64_t)echo,
@@ -1399,8 +1470,13 @@ static int drain_socket(struct app *a) {
         if (saw_data && now_us() - started >= TB_DRAIN_BUDGET_US) return saw_data;
         /* The decoder is behind: leave the rest in the socket so TCP slows
          * the Sender (which then drops frames before encoding) instead of
-         * queueing video here. Reading resumes as soon as a frame is done. */
-        if (!tb_decode_thread_wants_frames(a->decode_thread)) {
+         * queueing video here. Reading resumes as soon as a frame is done.
+         * A Sender paced by frame acks stays under its own, lower limit, so
+         * for it the socket is always read and cursor packets never wait
+         * behind video. */
+        const size_t frame_limit = a->sender_frame_acks ? TB_DECODE_QUEUE_ACKED_LIMIT_FRAMES
+                                                        : TB_DECODE_QUEUE_TARGET_FRAMES;
+        if (tb_decode_thread_frames_waiting(a->decode_thread) >= frame_limit) {
             a->throttled_reads++;
             return saw_data;
         }
@@ -1450,6 +1526,28 @@ static int send_all(int fd, const uint8_t *buf, size_t len) {
         return -1;
     }
     return 0;
+}
+
+/* Tells a Sender that paces by frame acks how many video frames this
+ * connection has finished with (decoded, shown raw or discarded), whenever
+ * that count has grown. */
+static void tb_receiver_send_frame_ack_if_needed(struct app *a) {
+    if (!a || a->client_fd < 0) return;
+    const uint64_t waiting = tb_decode_thread_frames_waiting(a->decode_thread);
+    if (waiting > a->max_frames_waiting) a->max_frames_waiting = waiting;
+    if (!a->sender_frame_acks) return;
+    /* A frame of the previous connection may still be decoding. */
+    const uint64_t done = a->video_frames_received > waiting ? a->video_frames_received - waiting : 0;
+    if (done <= a->video_frames_acked) return;
+
+    char json[48];
+    const int len = snprintf(json, sizeof(json), "{\"frames\":%llu}", (unsigned long long)done);
+    if (len <= 0 || (size_t)len >= sizeof(json)) return;
+    uint8_t pkt[4 + 1 + sizeof(json)];
+    write_be32(pkt, (uint32_t)(1 + len));
+    pkt[4] = TB_PKT_FRAME_ACK;
+    memcpy(pkt + 5, json, (size_t)len);
+    if (send_all(a->client_fd, pkt, 5 + (size_t)len) == 0) a->video_frames_acked = done;
 }
 
 /* Returns the send stamp of a move/drag that was sent, 0 otherwise. */
@@ -2023,7 +2121,7 @@ static void send_receiver_info(struct app *a) {
         "\"modeWidth\":%u,\"modeHeight\":%u,\"refreshRate\":60,"
         "\"hiDPI\":%s,\"captureWidth\":%u,\"captureHeight\":%u,"
         "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s,"
-        "\"supportsNightShift\":%s,\"supportsTrueTone\":%s}",
+        "\"supportsNightShift\":%s,\"supportsTrueTone\":%s,\"supportsFrameAcks\":true}",
         escaped_name,
         profile.panel_w,
         profile.panel_h,
@@ -2065,6 +2163,7 @@ static void close_client(struct app *a) {
     snprintf(a->input_control_mode, sizeof(a->input_control_mode), "off");
     tb_cursor_predictor_reset(&a->cursor_predictor);
     a->last_cursor.valid = 0;
+    a->sender_frame_acks = 0;
     SDL_EnableScreenSaver();
     tb_receiver_refresh_input_capture(a);
     tb_disp_set_connection_state(a->disp, 0);
@@ -2188,6 +2287,7 @@ int main(int argc, char **argv) {
                                    : (net_ip[0] ? net_ip : tb_i18n_get("receiver.network.not_detected"))));
     snprintf(a.language_pref, sizeof(a.language_pref), "%s", startup_language_pref);
     snprintf(a.input_control_mode, sizeof(a.input_control_mode), "%s", "off");
+    tb_receiver_start_permission_watch();
     a.last_input_monitoring_trusted = -1;
     a.last_accessibility_trusted = -1;
     tb_refresh_idle_localized_strings(&a);
@@ -2252,7 +2352,13 @@ int main(int argc, char **argv) {
 
         uint64_t t = now_ms();
 
-        if (t - a.last_ip_check_ms >= 1000) {
+        /* Not while video is showing: the lookups take ~20 ms on this thread
+         * (measured on the Intel iMac), once a second, and for that long the
+         * cursor does not move and no frame is acked or shown. The addresses
+         * only matter on the waiting screen and for Bonjour, and a link that
+         * changes ends the session anyway. */
+        const int streaming_video = a.client_fd >= 0 && a.have_video_frame;
+        if (!streaming_video && t - a.last_ip_check_ms >= 1000) {
             char refreshed_tb_ip[64] = {0};
             char refreshed_usb_ip[64] = {0};
             char refreshed_net_ip[64] = {0};
@@ -2384,6 +2490,10 @@ int main(int argc, char **argv) {
                 a.session_active = 0;
                 a.reported_night_shift = -1;   /* force one report per session */
                 a.reported_true_tone = -1;
+                a.sender_frame_acks = 0;   /* until this sender's hello says so */
+                a.video_frames_received = 0;
+                a.video_frames_acked = 0;
+                a.last_cursor_packet_us = 0;
                 a.last_recv_ms = t;
                 SDL_DisableScreenSaver();
                 fprintf(stderr, "[main] client connected\n");
@@ -2398,6 +2508,9 @@ int main(int argc, char **argv) {
                 close_client(&a);
             } else {
                 socket_activity = drain_result;
+                /* Ack before the upload and present below, so the Sender
+                 * can start on its next frame that much sooner. */
+                tb_receiver_send_frame_ack_if_needed(&a);
                 /* Show the newest frame the decode thread finished, if any:
                  * when it is behind, older ones are skipped rather than
                  * queued (5K 60 lag). Runs every pass, not only after reads,
@@ -2477,8 +2590,13 @@ int main(int argc, char **argv) {
          *             receiver was behind), throttled = socket reads put off
          *             because the decoder was behind (the Sender is being
          *             slowed), then decode, upload (NV12 → texture),
-         *             present time and the event-loop gap. Also logged
-         *             whenever frames were skipped or reads throttled. */
+         *             present time and the event-loop gap. queue = most
+         *             frames waiting to be decoded at once; pacing = acks
+         *             (the Sender waits for frame acks) or tcp. Also logged
+         *             whenever frames were skipped or reads throttled.
+         *   [cursor]  time between the Sender's cursor packets while the
+         *             overlay cursor moves; about 8 ms when nothing holds
+         *             them up. */
         if (t - a.last_latency_report_ms >= 1000) {
             a.last_latency_report_ms = t;
             struct tb_timing_summary rtt, wait, predict, decode, upload, present;
@@ -2493,7 +2611,12 @@ int main(int argc, char **argv) {
             const int have_split = tb_disp_take_frame_stats(a.disp, &upload, &present);
             const uint64_t throttled = a.throttled_reads;
             a.throttled_reads = 0;
-            if ((have_decode || have_split) && (have_rtt || have_wait || skipped > 0 || throttled > 0)) {
+            const uint64_t queue_max = a.max_frames_waiting;
+            a.max_frames_waiting = 0;
+            struct tb_timing_summary cursor_interval;
+            const int have_cursor = tb_timing_stats_take_summary(&a.cursor_interval_us, &cursor_interval) &&
+                                    cursor_interval.count >= 20;
+            if ((have_decode || have_split) && (have_rtt || have_wait || have_cursor || skipped > 0 || throttled > 0)) {
                 char decode_text[96] = "-", upload_text[96] = "-", present_text[96] = "-";
                 if (have_decode) tb_format_timing_ms(decode_text, sizeof(decode_text), &decode);
                 if (have_split) {
@@ -2506,11 +2629,13 @@ int main(int argc, char **argv) {
                     snprintf(loop_text, sizeof(loop_text), "p95=%.1fms max=%.1fms",
                              loop_gap.p95 / 1000.0, loop_gap.max / 1000.0);
                 }
-                tb_receiver_input_log("[frames] decoded=%llu shown=%llu skipped=%llu throttled=%llu | decode %s | upload %s | present %s | loop gap %s",
+                tb_receiver_input_log("[frames] decoded=%llu shown=%llu skipped=%llu throttled=%llu queue=%llu pacing=%s | decode %s | upload %s | present %s | loop gap %s",
                                       (unsigned long long)decoded,
                                       (unsigned long long)(have_split ? upload.count : 0),
                                       (unsigned long long)skipped,
                                       (unsigned long long)throttled,
+                                      (unsigned long long)queue_max,
+                                      a.sender_frame_acks ? "acks" : "tcp",
                                       decode_text, upload_text, present_text, loop_text);
             } else {
                 /* Keep the loop-gap window to the same second as the rest. */
@@ -2533,6 +2658,12 @@ int main(int argc, char **argv) {
                 }
                 tb_receiver_input_log("[latency] rtt %s | wait %s | predict %s | draw %s",
                                       rtt_text, wait_text, predict_text, draw_text);
+            }
+            if (have_cursor) {
+                tb_receiver_input_log("[cursor] packets n=%llu interval p50=%.1fms p95=%.1fms max=%.1fms",
+                                      (unsigned long long)cursor_interval.count,
+                                      cursor_interval.p50 / 1000.0, cursor_interval.p95 / 1000.0,
+                                      cursor_interval.max / 1000.0);
             }
         }
 
